@@ -31,6 +31,57 @@ allowed-tools: read_file, write_file, edit_file, bash, grep, glob
 
 ## 验证流程
 
+### 阶段 0：特征选择（可选但推荐）
+
+**目的**：减少特征数量，提高模型泛化能力
+
+**⚠️ 重要**：如果要在 Walk-forward 验证中使用特征选择，**必须先运行特征选择**！
+
+#### 0A. 特征选择命令
+
+```bash
+# 模型重要性法（推荐，Top 500 特征）
+python3 ml_services/feature_selection.py --method model --top-k 500 --horizon 20
+
+# 统计方法（Top 300 特征）
+python3 ml_services/feature_selection.py --method statistical --top-k 300 --horizon 20
+
+# 累积重要性法（自动选择特征数量，覆盖95%重要性）
+python3 ml_services/feature_selection.py --method cumulative_importance --horizon 20 --target-importance 0.95
+```
+
+#### 0B. 特征选择方法对比
+
+| 方法 | 优点 | 缺点 | 推荐场景 |
+|------|------|------|---------|
+| **model** | 效果稳定，计算快 | 依赖模型 | ⭐⭐⭐⭐⭐ 推荐 |
+| statistical | 不依赖模型，独立性强 | 可能遗漏非线性关系 | 特征较少时 |
+| cumulative_importance | 自动选择数量 | 可能选择过多特征 | 不确定特征数量时 |
+
+#### 0C. 输出文件位置
+
+特征选择后会生成以下文件：
+
+| 文件格式 | 路径示例 | 用途 |
+|---------|---------|------|
+| TXT 特征名称 | `output/model_importance_features_20260509.txt` | 直接读取特征名 |
+| CSV 选择结果 | `output/model_importance_selected_20260509.csv` | 包含重要性得分 |
+| 最新特征文件 | `output/model_importance_features_latest.txt` | 软链接到最新 |
+
+**验证特征选择文件是否存在**：
+
+```bash
+ls -la output/model_importance_features_*.txt output/statistical_features_*.txt
+```
+
+#### 0D. 特征选择检查清单
+
+- [ ] 已运行特征选择脚本（如 `--method model --top-k 500`）
+- [ ] 已确认输出文件存在（`output/model_importance_features_*.txt`）
+- [ ] 已确认预测周期与验证周期一致（如 `--horizon 20`）
+
+---
+
 ### 阶段 1：Walk-forward 测试
 
 **目的**：验证模型效果是否有提升
@@ -58,9 +109,17 @@ python3 ml_services/hsi_walk_forward.py --train-window 12 --horizon 1
 
 #### 1B. 个股模型测试
 
+**⚠️ 重要：需要先决定是否使用特征选择！**
+
 ```bash
-# 20天周期（推荐）
+# 【推荐】使用特征选择（Top 500 特征，需先运行阶段 0）
+python3 ml_services/walk_forward_validation.py --model-type catboost --horizon 20 --use-feature-selection
+
+# 使用全量特征（约 1132 个特征）
 python3 ml_services/walk_forward_validation.py --model-type catboost --horizon 20
+
+# 带置信度阈值
+python3 ml_services/walk_forward_validation.py --model-type catboost --horizon 20 --use-feature-selection --confidence-threshold 0.55
 
 # 板块验证（可选）
 python3 ml_services/walk_forward_by_sector.py --sector bank --horizon 20
@@ -68,11 +127,18 @@ python3 ml_services/walk_forward_by_sector.py --sector bank --horizon 20
 
 **个股判断标准**：
 
-| 指标 | 正常范围 | 优秀 | 数据泄漏信号 |
-|------|---------|------|-------------|
-| 准确率 | 50-55% | >55% | **>65%** |
-| 夏普比率 | 0.5-0.8 | >0.8 | - |
-| 最大回撤 | -5%~-10% | >-5% | - |
+| 指标 | 全量特征 (~1132) | Top 500 特征 | 数据泄漏信号 |
+|------|-----------------|--------------|-------------|
+| 准确率 | 50-55% | 50-55% | **>65%** |
+| 夏普比率 | 5.0-6.0 | 4.8-5.5 | - |
+| 最大回撤 | -0.8%~-1.0% | -0.7%~-0.9% | - |
+| 平均收益率 | +5%~+6% | +5%~+6% | - |
+| 总体盈亏比 | ~1.5 | ~1.5 | - |
+
+**使用特征选择的优势**：
+- 特征数量减少 55.8%（1132 → 500）
+- 性能基本持平，训练速度更快
+- 降低过拟合风险
 
 #### 1C. 两个模型对比验证
 
@@ -289,10 +355,16 @@ python3 ml_services/analyze_stock_causal_chain.py --full
 | 第 1277-1400 行 | `win_rate` | 邮件中的策略胜率 |
 | 第 2700-2720 行 | `suggestion` | 控制台建议文字 |
 
-**comprehensive_analysis.py 关键位置**：
-- 恒指三周期策略配置（搜索 `THREE_HORIZON_PATTERNS_HSI`）
-- 个股策略配置（搜索 `THREE_HORIZON_PATTERNS_STOCK`）
-- 报告输出格式
+**comprehensive_analysis.py 关键位置**（必须逐一检查并更新）：
+
+| 位置 | 搜索关键词 | 说明 |
+|------|-----------|------|
+| 第 95-104 行 | `THREE_HORIZON_PATTERNS = {` | 个股三周期模式胜率（8个模式） |
+| 第 111-120 行 | `HSI_THREE_HORIZON_PATTERNS = {` | 恒指三周期模式胜率（8个模式） |
+| 第 124-128 行 | `HSI_TRANSMISSION_ACCURACY` | 恒指传导准确率 |
+| 第 131-136 行 | `TRANSMISSION_ACCURACY` | 个股传导准确率 |
+
+**⚠️ 常见遗漏**：只更新 `hsi_prediction.py` 而忘记更新 `comprehensive_analysis.py`，导致个股策略配置过时。
 
 #### 4D. 代码与文档一致性验证（新增）
 
@@ -315,9 +387,146 @@ grep -E "81\.24|62\.36|49\.67|95\.00|85\.98" CLAUDE.md
 2. 更新代码中的硬编码数据
 3. 重新运行语法检查和测试
 
+---
+
+### 阶段 5：Fold 详细分析报告（必须执行）
+
+**⚠️ 重要：阶段 5 是必须执行的步骤，用于深度诊断模型表现！**
+
+**目的**：分析每个 Fold 的详细表现，识别问题 Fold，评估盈亏比和风险控制
+
+#### 5A. 运行 Fold 分析脚本
+
+在 Walk-forward 验证完成后，运行以下 Python 脚本生成详细分析：
+
+```python
+import pandas as pd
+import numpy as np
+
+# 读取预测分析数据（路径格式：output/YYYYMMDD_HHMMSS_catboost_20d/prediction_analysis.csv）
+# 找到最新的输出目录
+df = pd.read_csv('output/[最新目录]/prediction_analysis.csv')
+
+print("=" * 140)
+print("📊 各 Fold 详细交易分析（含盈亏比）")
+print("=" * 140)
+
+# 按 Fold 分组计算详细统计
+results = []
+for fold in range(1, 13):
+    fold_df = df[df['Fold'] == fold]
+    all_returns = fold_df['Actual_Return'].values
+    profit_trades = fold_df[fold_df['Actual_Return'] > 0]
+    loss_trades = fold_df[fold_df['Actual_Return'] < 0]
+    
+    avg_profit = np.mean(profit_trades['Actual_Return']) * 100 if len(profit_trades) > 0 else 0
+    avg_loss = np.mean(loss_trades['Actual_Return']) * 100 if len(loss_trades) > 0 else 0
+    profit_loss_ratio = abs(avg_profit / avg_loss) if avg_loss != 0 else 0
+    
+    # 评级计算
+    if profit_loss_ratio > 2.0:
+        rating = "⭐⭐⭐⭐⭐"
+    elif profit_loss_ratio >= 1.5:
+        rating = "⭐⭐⭐⭐"
+    elif profit_loss_ratio >= 1.0:
+        rating = "⭐⭐⭐"
+    else:
+        rating = "⚠️ 警告"
+    
+    results.append({
+        'Fold': fold, '测试期间': fold_df['Date'].values[0][:7] if len(fold_df) > 0 else 'N/A',
+        '总交易': len(fold_df), '准确率': len(fold_df[fold_df['Is_Correct'] == True]) / len(fold_df) * 100,
+        '平均收益': np.mean(all_returns) * 100, '最大收益': np.max(all_returns) * 100,
+        '最大亏损': np.min(all_returns) * 100,
+        '盈利次数': len(profit_trades), '亏损次数': len(loss_trades),
+        '盈利平均': avg_profit, '亏损平均': avg_loss,
+        '盈亏比': profit_loss_ratio, '评级': rating
+    })
+
+# 打印详细表格（必须使用 13 列格式）
+print("\n| Fold | 测试期间 | 总交易 | 准确率 | 平均收益 | 最大收益 | 最大亏损 | 盈利次数 | 亏损次数 | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |")
+print("|------|---------|--------|--------|---------|---------|---------|---------|---------|---------|---------|--------|------|")
+for r in results:
+    print(f"| {r['Fold']} | {r['测试期间']} | {r['总交易']} | {r['准确率']:.2f}% | {r['平均收益']:+.2f}% | {r['最大收益']:+.2f}% | {r['最大亏损']:+.2f}% | {r['盈利次数']} | {r['亏损次数']} | {r['盈利平均']:+.2f}% | {r['亏损平均']:+.2f}% | {r['盈亏比']:.2f} | {r['评级']} |")
+
+# 盈亏比排名表
+print("\n| 排名 | Fold | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |")
+# ... 继续生成其他表格
+```
+
+#### 5B. 必须输出的报告内容
+
+**总体统计表格**：
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 总交易次数 | XX,XXX | 12个Fold总计 |
+| 准确率 | XX.XX% | 正确预测比例 |
+| 平均收益率 | +X.XX% | 每次交易平均收益 |
+| 最大单次收益 | +XX.XX% | 单次最大盈利幅度 |
+| 最大单次亏损 | -XX.XX% | 单次最大亏损幅度 |
+| 盈利交易平均 | +XX.XX% | 盈利时的平均幅度 |
+| 亏损交易平均 | -X.XX% | 亏损时的平均幅度 |
+| **盈亏比** | X.XX | 平均盈利/平均亏损 |
+
+**各 Fold 详细表格**：
+
+> ⚠️ **格式要求**：必须严格使用以下 **13 列格式**，不可增减列！
+
+| Fold | 测试期间 | 总交易 | 准确率 | 平均收益 | 最大收益 | 最大亏损 | 盈利次数 | 亏损次数 | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |
+|------|---------|--------|--------|---------|---------|---------|---------|---------|---------|---------|--------|------|
+| 1 | 2025-01 | XXXX | XX.XX% | +X.XX% | +XX.XX% | -X.XX% | XXX | XXX | +X.XX% | -X.XX% | X.XX | ⭐⭐⭐⭐⭐ |
+| ... | ... | ... | ... | ... | ... | ... | ... | ... | ... | ... | ... | ... |
+
+**盈亏比排名表**：
+
+| 排名 | Fold | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |
+|------|------|---------|---------|--------|------|
+| 1 | Fold X | +XX.XX% | -X.XX% | X.XX | ⭐⭐⭐⭐⭐ 最优 |
+| ... | ... | ... | ... | ... | ... |
+
+**问题 Fold 分析**：
+
+| Fold | 问题 | 根本原因 |
+|------|------|---------|
+| Fold X | 盈亏比 < 1，收益为负 | 亏损幅度大于盈利幅度 |
+| ... | ... | ... |
+
+#### 5C. Fold 分析判断标准
+
+**盈亏比评级**：
+
+| 盈亏比范围 | 评级 | 说明 |
+|-----------|------|------|
+| > 2.0 | ⭐⭐⭐⭐⭐ 优秀 | 风险控制极好，盈利覆盖亏损 |
+| 1.5 - 2.0 | ⭐⭐⭐⭐ 良好 | 风险控制良好 |
+| 1.0 - 1.5 | ⭐⭐⭐ 一般 | 需要改进风险控制 |
+| < 1.0 | ⚠️ 警告 | 盈亏比倒挂，必须改进 |
+
+**问题 Fold 定义**：
+- 平均收益 < 0%
+- 盈亏比 < 1.5
+- 亏损次数 > 盈利次数 × 2
+
+#### 5D. Fold 分析检查清单
+
+- [ ] 已读取 prediction_analysis.csv 文件
+- [ ] 已生成总体统计表格（总交易、准确率、平均收益、最大收益、最大亏损、盈亏比）
+- [ ] 已生成各 Fold 详细表格（12个Fold）
+- [ ] 已生成盈亏比排名表
+- [ ] 已识别问题 Fold（盈亏比 < 1.5 或收益 < 0）
+- [ ] 已分析问题 Fold 的根本原因
+
 ## 执行检查清单
 
 在完成验证流程前，请确认：
+
+### 阶段 0 检查（特征选择）
+
+- [ ] 已决定是否使用特征选择
+- [ ] 如使用特征选择，已运行 `feature_selection.py`
+- [ ] 已确认特征选择文件存在（`output/model_importance_features_*.txt`）
+- [ ] 已确认预测周期与验证周期一致（如 `--horizon 20`）
 
 ### 阶段 1 检查（两个模型独立检查）
 
@@ -388,7 +597,10 @@ grep -E "81\.24|62\.36|49\.67|95\.00|85\.98" CLAUDE.md
 - [ ] 已更新 ml_services/hsi_ml_model.py（如需）
 
 #### 个股代码
-- [ ] 已更新 comprehensive_analysis.py 的策略配置
+- [ ] 已更新 comprehensive_analysis.py 的 `THREE_HORIZON_PATTERNS`（个股三周期模式胜率）
+- [ ] 已更新 comprehensive_analysis.py 的 `HSI_THREE_HORIZON_PATTERNS`（恒指三周期模式胜率）
+- [ ] 已更新 comprehensive_analysis.py 的 `TRANSMISSION_ACCURACY`（个股传导准确率）
+- [ ] 已更新 comprehensive_analysis.py 的 `HSI_TRANSMISSION_ACCURACY`（恒指传导准确率）
 - [ ] 已更新 ml_services/ml_trading_model.py（如需）
 
 #### 代码与文档一致性验证（新增）
@@ -401,6 +613,23 @@ grep -E "81\.24|62\.36|49\.67|95\.00|85\.98" CLAUDE.md
 - [ ] 已执行语法检查 `python3 -m py_compile <文件>`
 - [ ] 已运行测试 `python3 -m pytest tests/ -v`
 - [ ] 已运行 `python3 hsi_prediction.py --no-email` 验证输出正确
+
+### 阶段 5 检查（必须完成）
+
+**⚠️ 重要：此阶段用于深度诊断模型表现，识别问题 Fold！**
+
+#### Fold 分析报告
+- [ ] 已读取 prediction_analysis.csv 文件
+- [ ] 已生成总体统计表格（总交易、准确率、平均收益、最大收益、最大亏损、盈亏比）
+- [ ] 已生成各 Fold 详细表格（12个Fold）
+- [ ] 已生成盈亏比排名表
+- [ ] 已识别问题 Fold（盈亏比 < 1.5 或收益 < 0）
+- [ ] 已分析问题 Fold 的根本原因
+
+#### 关键指标检查
+- [ ] 总体盈亏比 > 1.5（风险控制达标）
+- [ ] 问题 Fold 数量 < 3（稳定性达标）
+- [ ] 最大单次亏损 < -30%（极端风险可控）
 
 ## 数据泄漏警告
 
@@ -487,6 +716,50 @@ grep -E "81\.24|62\.36|49\.67|95\.00|85\.98" CLAUDE.md
 
 ---
 
+## Fold 详细分析报告
+
+### 总体统计
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 总交易次数 | XX,XXX | 12个Fold总计 |
+| 准确率 | XX.XX% | 正确预测比例 |
+| 平均收益率 | +X.XX% | 每次交易平均收益 |
+| 最大单次收益 | +XX.XX% | 单次最大盈利幅度 |
+| 最大单次亏损 | -XX.XX% | 单次最大亏损幅度 |
+| 盈利交易平均 | +XX.XX% | 盈利时的平均幅度 |
+| 亏损交易平均 | -X.XX% | 亏损时的平均幅度 |
+| **盈亏比** | X.XX | 平均盈利/平均亏损 |
+
+### 各 Fold 详细表格
+
+| Fold | 测试期间 | 总交易 | 准确率 | 平均收益 | 最大收益 | 最大亏损 | 盈利次数 | 亏损次数 | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |
+|------|---------|--------|--------|---------|---------|---------|---------|---------|---------|---------|--------|------|
+| 1 | 2025-01 | XXXX | XX.XX% | +X.XX% | +XX.XX% | -X.XX% | XXX | XXX | +X.XX% | -X.XX% | X.XX | ⭐⭐⭐⭐⭐ |
+| ... | ... | ... | ... | ... | ... | ... | ... | ... | ... | ... | ... | ... |
+
+### 盈亏比排名
+
+| 排名 | Fold | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |
+|------|------|---------|---------|--------|------|
+| 1 | Fold X | +XX.XX% | -X.XX% | X.XX | ⭐⭐⭐⭐⭐ 最优 |
+| ... | ... | ... | ... | ... | ... |
+
+### 问题 Fold 分析
+
+| Fold | 问题 | 根本原因 |
+|------|------|---------|
+| Fold X | 盈亏比 < 1，收益为负 | 亏损幅度大于盈利幅度 |
+| ... | ... | ... |
+
+### 关键发现
+1. 盈亏比与收益率的关系：盈亏比 > 1.5 的 Fold 全部正收益
+2. 最佳表现：Fold X，盈亏比 X.XX，收益 +X.XX%
+3. 最差表现：Fold X，盈亏比 X.XX，收益 -X.XX%
+4. 总体盈亏比：X.XX（[达标/需改进]）
+
+---
+
 ## 文档更新清单
 
 **⚠️ 重要：恒指和个股数据必须分别更新**
@@ -544,40 +817,74 @@ grep -E "81\.24|62\.36|49\.67|95\.00|85\.98" CLAUDE.md
 
 ## 注意事项
 
-1. **两个模型独立验证**：恒指和个股模型有各自的验证脚本、判断标准、数据泄漏阈值
-2. **三周期验证必须分别执行**：
+1. **特征选择是可选但推荐的**：
+   - 如果要在 Walk-forward 验证中使用特征选择，**必须先运行特征选择**（阶段 0）
+   - 特征选择文件路径：`output/model_importance_features_*.txt`
+   - Walk-forward 验证时添加 `--use-feature-selection` 参数
+2. **两个模型独立验证**：恒指和个股模型有各自的验证脚本、判断标准、数据泄漏阈值
+3. **三周期验证必须分别执行**：
    - 恒指：`analyze_three_horizon_relationships.py`
    - 个股：`analyze_stock_causal_chain.py --full`（完整模型，禁止快速模式）
-3. **个股验证禁止快速模式**：
+4. **个股验证禁止快速模式**：
    - ❌ 禁止使用 `--quick` 参数
    - ❌ 禁止使用5只代表性股票
-   - ✅ 必须使用完整模型（730特征，59只股票）
-4. **顺序执行**：必须按阶段 1→2→3→4 顺序执行，前一阶段有效才进入下一阶段
-5. **记录完整**：每个阶段的测试结果必须完整记录
-6. **对比验证**：必须与更新前的指标对比，确认提升幅度
-7. **⚠️ 阶段 4 不可跳过**：
+   - ✅ 必须使用完整模型（推荐 Top 500 特征或全量特征 ~1132）
+5. **顺序执行**：必须按阶段 0→1→2→3→4→5 顺序执行，前一阶段有效才进入下一阶段
+6. **记录完整**：每个阶段的测试结果必须完整记录
+7. **对比验证**：必须与更新前的指标对比，确认提升幅度
+8. **⚠️ 阶段 4 不可跳过**：
    - 文档更新后**必须**同步更新代码
    - 常见问题：文档更新了，但代码中的硬编码数据没有更新
    - 导致：邮件报告显示旧数据，用户收到错误信息
    - **必须执行代码与文档一致性验证**
-7. **文档同步**：
+9. **⚠️ 阶段 5 必须执行**：
+   - Fold 分析报告用于深度诊断模型表现
+   - 识别问题 Fold（盈亏比 < 1.5 或收益 < 0）
+   - 分析问题根因，指导后续优化
+   - **输出格式必须包含：总体统计、各Fold详细表格、盈亏比排名、问题Fold分析**
+   - **⚠️ 格式要求**：各 Fold 详细表格必须严格使用 **13 列格式**，不可增减列：
+     ```
+     | Fold | 测试期间 | 总交易 | 准确率 | 平均收益 | 最大收益 | 最大亏损 | 盈利次数 | 亏损次数 | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |
+     ```
+   - 盈亏比排名表使用 **6 列格式**：
+     ```
+     | 排名 | Fold | 盈利平均 | 亏损平均 | 盈亏比 | 评级 |
+     ```
+10. **文档同步**：
    - 代码更新后立即同步文档，避免信息不一致
    - **文档更新范围包括 `docs/` 目录下所有相关文档**
    - **恒指和个股数据必须分别更新，不能只更新其中一个**
-8. **语法检查**：每次代码修改后必须执行 `python3 -m py_compile`
-9. **核心文件优先**：hsi_prediction.py（恒指）和 comprehensive_analysis.py（个股）是主要入口
+11. **语法检查**：每次代码修改后必须执行 `python3 -m py_compile`
+12. **核心文件优先**：hsi_prediction.py（恒指）和 comprehensive_analysis.py（个股）是主要入口
 
 ## 快速参考
+
+### 核心命令速查
+
+| 任务 | 命令 |
+|------|------|
+| **特征选择** | `python3 ml_services/feature_selection.py --method model --top-k 500 --horizon 20` |
+| **恒指 Walk-forward** | `python3 ml_services/hsi_walk_forward.py --train-window 12 --horizon 20` |
+| **个股 Walk-forward（推荐）** | `python3 ml_services/walk_forward_validation.py --model-type catboost --horizon 20 --use-feature-selection` |
+| **个股 Walk-forward（全量特征）** | `python3 ml_services/walk_forward_validation.py --model-type catboost --horizon 20` |
 
 ### 模型对比
 
 | 项目 | 恒指模型 | 个股模型 |
 |------|---------|---------|
 | 验证脚本 | `hsi_walk_forward.py` | `walk_forward_validation.py` |
-| 特征数量 | 33个（增强模型） | 730个（完整模型） |
+| 特征数量 | 33个（增强模型） | ~1132个（全量）/ 500个（推荐） |
 | 数据泄漏阈值 | >85% | >65% |
 | 最优策略 | 假突破(101) 95% | 一致看涨(111) 56% |
 | 预测概率与实际方向相关性 | 正向 r=+0.35 | 弱正向 r=+0.03 |
+
+### 特征选择相关文件
+
+| 文件类型 | 路径 | 说明 |
+|---------|------|------|
+| 特征选择输出 | `output/model_importance_features_*.txt` | 模型重要性法结果 |
+| 特征选择输出 | `output/statistical_features_*.txt` | 统计方法结果 |
+| 特征选择缓存 | `data/feature_selection_*.json` | Top 300 特征（JSON格式） |
 
 ### 模型文件位置
 - 恒指模型：`data/hsi_models/hsi_catboost_*.cbm`

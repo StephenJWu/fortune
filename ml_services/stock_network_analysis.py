@@ -15,6 +15,7 @@
 """
 
 import warnings
+import math
 warnings.filterwarnings('ignore')
 
 import os
@@ -879,12 +880,20 @@ def generate_diversification_recommendations(mst_graph, communities, centrality_
     }
 
 
-def build_lead_lag_network(stock_data, max_lag=5, use_all_stocks=False):
+def build_lead_lag_network(stock_data, max_lag=5, use_all_stocks=False,
+                            p_threshold=0.01, top_k_edges=50):
     """
     构建领先滞后有向网络
     使用 Granger 因果检验，边从领先股票指向滞后股票
+
+    参数：
+    - stock_data: 股票数据字典
+    - max_lag: 最大滞后期
+    - use_all_stocks: 使用全部股票还是代表股票
+    - p_threshold: 显著性阈值（默认 0.01，比原来的 0.05 更严格）
+    - top_k_edges: 最多保留多少条边（默认 50）
     """
-    print(f"  🔀 构建领先滞后网络（max_lag={max_lag}）...")
+    print(f"  🔀 构建领先滞后网络（max_lag={max_lag}, p<{p_threshold}, top_{top_k_edges}边）...")
 
     returns_dict = {}
     for stock_code, df in stock_data.items():
@@ -911,7 +920,7 @@ def build_lead_lag_network(stock_data, max_lag=5, use_all_stocks=False):
                    sector=get_stock_sector(code),
                    name=get_stock_name(code))
 
-    # Granger 因果检验
+    # Granger 因果检验（使用更严格的阈值）
     for i, stock1 in enumerate(test_stocks):
         for j, stock2 in enumerate(test_stocks):
             if i != j and stock1 in returns_df.columns and stock2 in returns_df.columns:
@@ -921,7 +930,7 @@ def build_lead_lag_network(stock_data, max_lag=5, use_all_stocks=False):
 
                     for lag in range(1, max_lag + 1):
                         p_value = result[lag][0]['ssr_ftest'][1]
-                        if p_value < 0.05:
+                        if p_value < p_threshold:  # 使用传入的阈值
                             # 边权 = -log(p)，权重越大越显著
                             weight = -np.log10(p_value)
                             G.add_edge(stock1, stock2,
@@ -930,6 +939,17 @@ def build_lead_lag_network(stock_data, max_lag=5, use_all_stocks=False):
                             break  # 只保留最显著的滞后期
                 except Exception:
                     continue
+
+    # 过滤：只保留 top_k_edges 条最显著的边
+    if G.number_of_edges() > top_k_edges:
+        edges_data = [(u, v, d) for u, v, d in G.edges(data=True)]
+        edges_data.sort(key=lambda x: x[2]['weight'], reverse=True)
+        G_filtered = nx.DiGraph()
+        G_filtered.add_nodes_from(G.nodes(data=True))
+        for u, v, d in edges_data[:top_k_edges]:
+            G_filtered.add_edge(u, v, **d)
+        print(f"    ✅ 领先滞后网络: {G_filtered.number_of_nodes()} 节点, {G_filtered.number_of_edges()} 边（从 {G.number_of_edges()} 条筛选）")
+        return G_filtered
 
     print(f"    ✅ 领先滞后网络: {G.number_of_nodes()} 节点, {G.number_of_edges()} 边")
     return G
@@ -1036,53 +1056,168 @@ def calculate_network_stability(evolution):
 # ML 特征导出
 # ============================================================
 
-def export_network_features(centrality_dict, communities, bridge_stocks, stock_codes):
+def export_network_features(centrality_dict, communities, bridge_stocks, stock_codes, threshold_graph=None):
     """
     导出网络特征供 ML 模型使用
-    12个特征：中心性(5) + 社区(3) + MST(2) + 风险(2)
+
+    特征设计原则：使用连续值特征替代二元特征，提供更丰富的信息量
+
+    特征列表（15个）：
+    - 中心性特征(5): degree, betweenness, eigenvector, closeness, composite
+    - 社区特征(4): community_id, community_size, community_centrality_rank, sector_cohesion
+    - MST特征(2): mst_degree, mst_neighbor_sectors
+    - 跨社区特征(1): inter_community_ratio
+    - 结构洞特征(3): constraint, effective_size, local_clustering
+
+    已移除的二元特征：
+    - net_sector_community_match (0/1) -> 替换为 net_sector_cohesion (连续值)
+    - net_is_bridge_stock (0/1) -> 替换为 net_inter_community_ratio (连续值)
+    - net_systemic_risk_score -> 移除（与 betweenness 高度相关）
     """
     print("  🤖 导出 ML 网络特征...")
 
-    # 桥梁股票集合
-    bridge_set = set(b['stock'] for b in bridge_stocks)
+    # 预计算社区统计信息
+    community_stats = {}
+    if communities:
+        for comm_id in set(communities.values()):
+            comm_stocks = [s for s, c in communities.items() if c == comm_id]
+            comm_centralities = [centrality_dict.get(s, {}).get('composite', 0) for s in comm_stocks]
+            community_stats[comm_id] = {
+                'size': len(comm_stocks),
+                'stocks': set(comm_stocks),
+                'avg_centrality': np.mean(comm_centralities) if comm_centralities else 0,
+                'max_centrality': max(comm_centralities) if comm_centralities else 0
+            }
+
+    # 预计算板块-社区映射
+    sector_community_map = defaultdict(lambda: defaultdict(int))
+    if communities:
+        for code, comm_id in communities.items():
+            sector = get_stock_sector(code)
+            sector_community_map[sector][comm_id] += 1
+
+    # 计算跨社区连接比例（用于替代桥梁股二元特征）
+    inter_community_connections = {}
+    if threshold_graph is not None:
+        for code in stock_codes:
+            if code in threshold_graph:
+                neighbors = list(threshold_graph.neighbors(code))
+                if len(neighbors) > 0 and communities:
+                    # 计算邻居中不同社区的比例
+                    my_comm = communities.get(code, -1)
+                    diff_comm_count = sum(1 for n in neighbors
+                                         if communities.get(n, -1) != my_comm)
+                    inter_community_connections[code] = diff_comm_count / len(neighbors)
+                else:
+                    inter_community_connections[code] = 0
+            else:
+                inter_community_connections[code] = 0
 
     features = {}
     for code in stock_codes:
         c = centrality_dict.get(code, {})
         comm = communities.get(code, -1)
-
-        # 计算社区大小
-        community_size = sum(1 for v in communities.values() if v == comm) if communities else 0
-
-        # 判断社区是否匹配板块
         sector = get_stock_sector(code)
-        sector_match = 0
-        if communities:
-            # 同板块的社区众数
-            same_sector_comms = [communities[s] for s in communities
+
+        # ========== 中心性特征（5个，保持不变）==========
+        degree_centrality = c.get('degree', 0)
+        betweenness_centrality = c.get('betweenness', 0)
+        eigenvector_centrality = c.get('eigenvector', 0)
+        closeness_centrality = c.get('closeness', 0)
+        composite_centrality = c.get('composite', 0)
+
+        # ========== 社区特征（4个，改进）==========
+        # 1. 社区ID（保持不变，分类特征）
+        community_id = comm
+
+        # 2. 社区大小（保持不变）
+        community_size = community_stats.get(comm, {}).get('size', 0)
+
+        # 3. 【新增】社区内中心性排名（0~1连续值）
+        # 表示该股票在其社区内的重要程度
+        # 默认值-1表示未知社区，与有效值(0~1)区分
+        community_centrality_rank = -1
+        if comm in community_stats and community_stats[comm]['size'] > 1:
+            comm_stocks = community_stats[comm]['stocks']
+            comm_centralities = [(s, centrality_dict.get(s, {}).get('composite', 0))
+                                for s in comm_stocks]
+            comm_centralities.sort(key=lambda x: x[1], reverse=True)
+            for rank, (s, _) in enumerate(comm_centralities):
+                if s == code:
+                    community_centrality_rank = 1 - (rank / (len(comm_centralities) - 1))
+                    break
+
+        # 4. 【新增】板块内聚度（替代 sector_community_match 二元特征）
+        # 计算方式：同板块股票中与该股票同社区的比例（连续值 0~1）
+        sector_cohesion = 0.0
+        if sector and sector in sector_community_map:
+            same_sector_stocks = [s for s in stock_codes
                                  if s in STOCK_SECTOR_MAPPING
-                                 and STOCK_SECTOR_MAPPING[s]['sector'] == sector]
-            if same_sector_comms:
-                from collections import Counter
-                majority = Counter(same_sector_comms).most_common(1)[0][0]
-                sector_match = 1 if comm == majority else 0
+                                 and STOCK_SECTOR_MAPPING[s].get('sector') == sector]
+            if len(same_sector_stocks) > 1:
+                same_comm_count = sum(1 for s in same_sector_stocks
+                                     if communities.get(s, -1) == comm)
+                sector_cohesion = same_comm_count / len(same_sector_stocks)
+
+        # ========== MST特征（2个，保持不变）==========
+        # 将在 add_mst_degree_features 中填充
+        mst_degree = 0
+        mst_neighbor_sectors = 0
+
+        # ========== 【新增】跨社区连接比例（替代桥梁股二元特征）==========
+        # 表示该股票连接不同社区的程度（连续值 0~1）
+        inter_community_ratio = inter_community_connections.get(code, 0)
+
+        # ========== 【新增】结构洞特征（2个）==========
+        # 1. Burt 约束系数（低=结构洞机会多，信息优势大）
+        # 范围：0~1，低值表示该股票连接多个不相连的群体，具有信息套利优势
+        constraint = 1.0  # 默认高约束（无机会）
+        effective_size = 0.0
+        if threshold_graph is not None and code in threshold_graph:
+            try:
+                constraint_val = nx.constraint(threshold_graph, [code]).get(code, 1.0)
+                # 处理 NaN：如果计算结果为 NaN，使用默认值
+                if constraint_val is not None and not math.isnan(constraint_val):
+                    constraint = constraint_val
+                effective_size_val = nx.effective_size(threshold_graph, [code]).get(code, 0)
+                if effective_size_val is not None and not math.isnan(effective_size_val):
+                    effective_size = effective_size_val
+            except Exception:
+                pass
+
+        # 2. 局部聚类系数（高=局部羊群效应强，板块共振明显）
+        # 范围：0~1，高值表示邻居之间也相互连接，形成紧密群体
+        local_clustering = 0.0
+        if threshold_graph is not None and code in threshold_graph:
+            try:
+                local_clustering = nx.clustering(threshold_graph, code)
+            except Exception:
+                pass
 
         features[code] = {
-            'net_degree_centrality': c.get('degree', 0),
-            'net_betweenness_centrality': c.get('betweenness', 0),
-            'net_eigenvector_centrality': c.get('eigenvector', 0),
-            'net_closeness_centrality': c.get('closeness', 0),
-            'net_composite_centrality': c.get('composite', 0),
-            'net_community_id': comm,
+            # 中心性特征
+            'net_degree_centrality': degree_centrality,
+            'net_betweenness_centrality': betweenness_centrality,
+            'net_eigenvector_centrality': eigenvector_centrality,
+            'net_closeness_centrality': closeness_centrality,
+            'net_composite_centrality': composite_centrality,
+            # 社区特征
+            'net_community_id': community_id,
             'net_community_size': community_size,
-            'net_sector_community_match': sector_match,
-            'net_mst_degree': 0,  # 将在下面填充
-            'net_mst_neighbor_sectors': 0,
-            'net_systemic_risk_score': c.get('betweenness', 0) * 0.5 + c.get('eigenvector', 0) * 0.5,
-            'net_is_bridge_stock': 1 if code in bridge_set else 0
+            'net_community_centrality_rank': community_centrality_rank,
+            'net_sector_cohesion': sector_cohesion,
+            # MST特征
+            'net_mst_degree': mst_degree,
+            'net_mst_neighbor_sectors': mst_neighbor_sectors,
+            # 跨社区特征
+            'net_inter_community_ratio': inter_community_ratio,
+            # 结构洞特征
+            'net_constraint': constraint,
+            'net_effective_size': effective_size,
+            'net_local_clustering': local_clustering,
         }
 
-    print(f"    ✅ 导出 {len(features)} 只股票的网络特征（12个）")
+    print(f"    ✅ 导出 {len(features)} 只股票的网络特征（15个）")
     return features
 
 
@@ -1377,47 +1512,189 @@ def visualize_centrality_ranking(centrality_dict, output_dir, top_n=20):
     print(f"    ✅ 已保存: {path}")
 
 
-def visualize_lead_lag_network(digraph, output_dir):
-    """可视化领先滞后有向网络"""
+def create_layered_layout(digraph):
+    """按出度创建分层布局
+
+    出度高的节点在上层（领导者），出度低的在下层（跟随者）
+    """
+    out_degrees = dict(digraph.out_degree())
+    if not out_degrees:
+        return {}
+
+    max_degree = max(out_degrees.values())
+
+    # 计算每个节点的层级（Y坐标）
+    pos = {}
+    for node in digraph.nodes():
+        degree = out_degrees.get(node, 0)
+        # Y坐标：出度高的在上（Y值大），范围 [0, 1]
+        y = degree / max_degree if max_degree > 0 else 0.5
+        pos[node] = [0, y]  # 临时坐标
+
+    # 在同层级内均匀分布 X 坐标
+    # 将 Y 坐标四舍五入到 2 位小数，作为层级标识
+    y_levels = {}
+    for node, (x, y) in pos.items():
+        y_rounded = round(y * 10) / 10  # 按 0.1 精度分组
+        if y_rounded not in y_levels:
+            y_levels[y_rounded] = []
+        y_levels[y_rounded].append(node)
+
+    # 为每层的节点均匀分布 X 坐标
+    for y_level, nodes in y_levels.items():
+        n = len(nodes)
+        for i, node in enumerate(nodes):
+            # X 坐标：在 [0.1, 0.9] 范围内均匀分布
+            x = 0.1 + 0.8 * (i + 1) / (n + 1)
+            pos[node] = [x, y_level]
+
+    return pos
+
+
+def visualize_lead_lag_network(digraph, output_dir, title=None, filename=None):
+    """可视化领先滞后有向网络（分层布局）
+
+    参数：
+    - digraph: 有向图
+    - output_dir: 输出目录
+    - title: 图标题（可选）
+    - filename: 文件名（可选，默认 network_lead_lag.png）
+    """
     setup_chinese_font()
-    print("  📊 生成领先滞后网络图...")
+    print("  📊 生成领先滞后网络图（分层布局）...")
 
     if digraph.number_of_nodes() == 0:
         return
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 12))
-    pos = nx.spring_layout(digraph, seed=RANDOM_SEED)
+    fig, ax = plt.subplots(1, 1, figsize=(16, 10))
+
+    # 使用分层布局
+    pos = create_layered_layout(digraph)
 
     # 节点大小 = 出度（领导力）
     out_degrees = dict(digraph.out_degree())
     max_out = max(out_degrees.values()) if out_degrees else 1
-    node_sizes = [200 + 800 * (out_degrees.get(n, 0) / max(max_out, 1))
+    node_sizes = [300 + 700 * (out_degrees.get(n, 0) / max(max_out, 1))
                   for n in digraph.nodes()]
 
     node_colors = get_node_colors(digraph)
 
-    # 边颜色深浅 = 显著性
+    # 创建节点到颜色的映射
+    node_color_map = {}
+    for i, node in enumerate(digraph.nodes()):
+        node_color_map[node] = node_colors[i]
+
+    # 边颜色 = 源节点（领先股票）的板块颜色
+    # 边宽度 = 显著性
     edge_weights = [digraph[u][v].get('weight', 1) for u, v in digraph.edges()]
     max_w = max(edge_weights) if edge_weights else 1
-    edge_alphas = [0.2 + 0.8 * (w / max(max_w, 1)) for w in edge_weights]
+    edge_colors = []
+    edge_widths = []
+    for (u, v), w in zip(digraph.edges(), edge_weights):
+        intensity = w / max(max_w, 1)
+        # 使用源节点的板块颜色
+        source_color = node_color_map.get(u, '#666666')
+        # 将颜色稍微调淡（混合白色）
+        import matplotlib.colors as mcolors
+        rgb = mcolors.to_rgb(source_color)
+        faded_rgb = tuple(min(1, c + 0.3 * (1 - intensity)) for c in rgb)
+        edge_colors.append(faded_rgb)
+        # 宽度：1.0 到 2.5
+        edge_widths.append(1.0 + 1.5 * intensity)
 
-    nx.draw_networkx_edges(digraph, pos, ax=ax, alpha=0.4,
-                           edge_color=edge_alphas, width=1,
-                           arrowsize=10, connectionstyle='arc3,rad=0.1')
+    # 先画节点
     nx.draw_networkx_nodes(digraph, pos, ax=ax, node_color=node_colors,
-                           node_size=node_sizes, edgecolors='white', linewidths=0.5)
+                           node_size=node_sizes, edgecolors='white', linewidths=2)
 
+    # 画边（箭头在节点上层）
+    nx.draw_networkx_edges(digraph, pos, ax=ax,
+                           edge_color=edge_colors, width=edge_widths,
+                           arrowsize=15, arrowstyle='->',
+                           connectionstyle='arc3,rad=0.1',
+                           min_source_margin=5, min_target_margin=5)
+
+    # 标签
     labels = {n: get_stock_name(n) for n in digraph.nodes()}
-    nx.draw_networkx_labels(digraph, pos, labels, ax=ax, font_size=7,
-                            font_family='WenQuanYi Micro Hei')
+    nx.draw_networkx_labels(digraph, pos, labels, ax=ax, font_size=9,
+                            font_family='WenQuanYi Micro Hei',
+                            font_weight='bold')
 
-    ax.set_title('领先滞后网络（Granger因果）', fontsize=16, fontweight='bold')
+    # 标题
+    if title is None:
+        title = '领先滞后网络（Granger因果，分层布局）'
+    ax.set_title(title, fontsize=14, fontweight='bold')
+
+    # 添加层级说明
+    ax.text(0.02, 0.98, '上层 = 领导者（高出度）', transform=ax.transAxes,
+            fontsize=10, verticalalignment='top', color='#666666')
+    ax.text(0.02, 0.94, '下层 = 跟随者（低出度）', transform=ax.transAxes,
+            fontsize=10, verticalalignment='top', color='#666666')
+    ax.text(0.02, 0.90, '边颜色 = 领先股票板块色', transform=ax.transAxes,
+            fontsize=10, verticalalignment='top', color='#666666')
+
     ax.axis('off')
     plt.tight_layout()
-    path = os.path.join(output_dir, 'network_lead_lag.png')
+
+    if filename is None:
+        filename = 'network_lead_lag.png'
+    path = os.path.join(output_dir, filename)
     plt.savefig(path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"    ✅ 已保存: {path}")
+
+
+def visualize_lead_lag_by_community(digraph, partition, output_dir):
+    """按社区生成领先滞后子图
+
+    参数：
+    - digraph: 完整的有向图
+    - partition: 社区划分字典 {node: community_id}
+    - output_dir: 输出目录
+    """
+    print("  📊 生成社区领先滞后子图...")
+
+    # 转换 partition 格式：{node: comm_id} -> {comm_id: [nodes]}
+    communities = {}
+    for node, comm_id in partition.items():
+        if comm_id not in communities:
+            communities[comm_id] = []
+        communities[comm_id].append(node)
+
+    for comm_id, members in communities.items():
+        # 创建包含跨社区入边的子图
+        # 1. 包含社区内的所有节点
+        # 2. 包含指向社区内节点的所有边（包括跨社区边）
+        subgraph = nx.DiGraph()
+
+        # 添加社区内节点
+        for node in members:
+            if node in digraph.nodes():
+                subgraph.add_node(node, **digraph.nodes[node])
+
+        # 添加指向社区内节点的边（包括跨社区边）
+        edge_count = 0
+        for u, v in digraph.edges():
+            if v in members:  # 目标节点在社区内
+                # 添加源节点（如果不在社区内）
+                if u not in members and u in digraph.nodes():
+                    subgraph.add_node(u, **digraph.nodes[u])
+                subgraph.add_edge(u, v, **digraph.edges[u, v])
+                edge_count += 1
+
+        if subgraph.number_of_edges() == 0:
+            continue
+
+        # 获取该社区的主要板块
+        sectors = [get_stock_sector(s) for s in members]
+        from collections import Counter
+        main_sector = Counter(sectors).most_common(1)[0][0]
+        sector_name = SECTOR_NAME_MAPPING.get(main_sector, main_sector)
+
+        visualize_lead_lag_network(
+            subgraph, output_dir,
+            title=f'社区 {comm_id} 领先滞后网络（{sector_name}，{len(members)}只，含跨社区入边）',
+            filename=f'network_lead_lag_community_{comm_id}.png'
+        )
 
 
 def visualize_network_evolution(evolution, output_dir):
@@ -2063,6 +2340,10 @@ def main():
                         help='Granger因果检验最大滞后期（默认5）')
     parser.add_argument('--full-granger', action='store_true',
                         help='使用全部股票进行Granger检验（默认仅代表股票）')
+    parser.add_argument('--p-threshold', type=float, default=0.01,
+                        help='Granger因果显著性阈值（默认0.01，比原来0.05更严格）')
+    parser.add_argument('--top-edges', type=int, default=50,
+                        help='最多显示多少条边（默认50，解决图太密集问题）')
     parser.add_argument('--resolution', type=float, default=1.0,
                         help='Louvain社区检测分辨率参数（默认1.0）')
     parser.add_argument('--portfolio-size', type=int, default=10,
@@ -2168,7 +2449,8 @@ def main():
     diversification = generate_diversification_recommendations(
         mst_graph, communities, centrality_dict, args.portfolio_size)
     lead_lag_graph = build_lead_lag_network(
-        stock_data, args.max_lag, args.full_granger)
+        stock_data, args.max_lag, args.full_granger,
+        args.p_threshold, args.top_edges)
 
     # 6. 动态分析（可选）
     evolution = []
@@ -2181,7 +2463,8 @@ def main():
 
     # 7. ML 特征导出
     ml_features = export_network_features(centrality_dict, communities,
-                                           bridge_stocks, stock_codes)
+                                           bridge_stocks, stock_codes,
+                                           threshold_graph=threshold_graph)
     ml_features = add_mst_degree_features(ml_features, mst_graph)
     save_ml_features(ml_features, args.output_dir)
 
@@ -2200,6 +2483,8 @@ def main():
 
         if lead_lag_graph.number_of_edges() > 0:
             visualize_lead_lag_network(lead_lag_graph, args.output_dir)
+            # 生成社区领先滞后子图
+            visualize_lead_lag_by_community(lead_lag_graph, communities, args.output_dir)
 
         if evolution:
             visualize_network_evolution(evolution, args.output_dir)

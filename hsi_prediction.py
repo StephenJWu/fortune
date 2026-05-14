@@ -1021,47 +1021,87 @@ class HSI_Predictor:
         }
 
         # ========== 成交额异常检测（使用腾讯财经数据）==========
-        # 优先使用历史数据中的成交额（昨日收盘），而非实时数据
+        # 使用腾讯财经的历史成交额数据，确保数据源一致性
         if self.tencent_hsi_data is not None and 'Amount' in self.tencent_hsi_data.columns:
+            # 当前成交额（最新数据）
             current_amount = self.tencent_hsi_data['Amount'].iloc[-1]  # 亿港元
 
-            # 使用腾讯财经的历史成交额数据（与当前值数据源一致）
-            # 排除当日数据，使用历史数据进行统计
+            # 使用腾讯财经的历史成交额数据（排除最新一天）
+            # 这样确保数据源一致性，避免 yfinance 估算与腾讯数据的偏差
             amount_history = self.tencent_hsi_data['Amount'].iloc[:-1]
 
-            # 使用Z-Score检测
-            zscore_detector = ZScoreDetector(
-                window_size=window_size,
-                threshold=threshold,
-                time_interval='day'
-            )
+            # 检查是否有足够的历史数据
+            if len(amount_history) >= window_size:
+                # 使用Z-Score检测
+                zscore_detector = ZScoreDetector(
+                    window_size=window_size,
+                    threshold=threshold,
+                    time_interval='day'
+                )
 
-            amount_zscore_result = zscore_detector.detect_anomaly(
-                metric_name='amount',
-                current_value=current_amount,
-                history=amount_history,
-                timestamp=current_timestamp
-            )
+                amount_zscore_result = zscore_detector.detect_anomaly(
+                    metric_name='amount',
+                    current_value=current_amount,
+                    history=amount_history,
+                    timestamp=current_timestamp
+                )
 
-            if amount_zscore_result:
-                anomalies['amount_anomaly'] = {
-                    'type': '成交额异常',
-                    'z_score': amount_zscore_result['z_score'],
-                    'current_value': current_amount,
-                    'mean': amount_zscore_result['mean'],
-                    'std': amount_zscore_result['std'],
-                    'severity': amount_zscore_result['severity'],
-                    'direction': '放大' if amount_zscore_result['z_score'] > 0 else '萎缩',
-                    'detection_method': 'zscore_tencent',
-                    'data_source': '腾讯财经API'
-                }
+                if amount_zscore_result:
+                    anomalies['amount_anomaly'] = {
+                        'type': '成交额异常',
+                        'z_score': amount_zscore_result['z_score'],
+                        'current_value': current_amount,
+                        'mean': amount_zscore_result['mean'],
+                        'std': amount_zscore_result['std'],
+                        'severity': amount_zscore_result['severity'],
+                        'direction': '放大' if amount_zscore_result['z_score'] > 0 else '萎缩',
+                        'detection_method': 'zscore_tencent',
+                        'data_source': '腾讯财经API（历史数据）'
+                    }
+                else:
+                    anomalies['amount_anomaly'] = None
             else:
-                anomalies['amount_anomaly'] = None
+                # 腾讯数据不足，回退到 yfinance 估算
+                df['Amount_Estimated'] = df['Volume'] * df['Close'] / 100000000
+                amount_history_fallback = df['Amount_Estimated'].iloc[:-1]
 
-            # 记录成交额数据用于后续显示
+                zscore_detector = ZScoreDetector(
+                    window_size=window_size,
+                    threshold=threshold,
+                    time_interval='day'
+                )
+
+                amount_zscore_result = zscore_detector.detect_anomaly(
+                    metric_name='amount',
+                    current_value=current_amount,
+                    history=amount_history_fallback,
+                    timestamp=current_timestamp
+                )
+
+                if amount_zscore_result:
+                    anomalies['amount_anomaly'] = {
+                        'type': '成交额异常',
+                        'z_score': amount_zscore_result['z_score'],
+                        'current_value': current_amount,
+                        'mean': amount_zscore_result['mean'],
+                        'std': amount_zscore_result['std'],
+                        'severity': amount_zscore_result['severity'],
+                        'direction': '放大' if amount_zscore_result['z_score'] > 0 else '萎缩',
+                        'detection_method': 'zscore_tencent_fallback',
+                        'data_source': '腾讯财经API（当前）+ yfinance估算（历史）',
+                        'warning': '腾讯历史数据不足，使用yfinance估算作为历史基准'
+                    }
+                else:
+                    anomalies['amount_anomaly'] = None
+
+            # 记录成交额数据用于后续显示（使用腾讯财经数据）
             anomalies['amount_data'] = {
                 'current': current_amount,
-                'ma250': amount_history.tail(250).mean() if len(amount_history) >= 250 else amount_history.mean()
+                'ma20': amount_history.tail(20).mean() if len(amount_history) >= 20 else None,
+                'ma60': amount_history.tail(60).mean() if len(amount_history) >= 60 else None,
+                'ma120': amount_history.tail(120).mean() if len(amount_history) >= 120 else None,
+                'ma250': amount_history.tail(250).mean() if len(amount_history) >= 250 else amount_history.mean(),
+                'data_source': '腾讯财经API'
             }
         else:
             anomalies['amount_anomaly'] = None
@@ -1569,19 +1609,18 @@ class HSI_Predictor:
 
             # 传导模式显示
             prediction_date = transmission_info.get('prediction_date', '')
-            is_current = transmission_info.get('is_current_prediction', False)
-            date_label = "今日预测" if is_current else f"5个交易日前（{prediction_date}）的预测"
+            estimated_accuracy = transmission_info.get('estimated_20d_accuracy')
             content += f"""
-            <div style="margin-top: 20px; padding: 15px; background: {'#f0fdf4' if transmission_info.get('transmission_mode') else '#f8fafc'}; border-radius: 8px; border-left: 4px solid {'#22c55e' if transmission_info.get('transmission_mode') else '#6b7280'};">
-                <h4 style="margin: 0 0 10px 0; font-size: 14px; color: #374151;">🔄 传导模式验证</h4>
+            <div style="margin-top: 20px; padding: 15px; background: {'#f0fdf4' if estimated_accuracy and estimated_accuracy > 80 else '#f8fafc'}; border-radius: 8px; border-left: 4px solid {'#22c55e' if estimated_accuracy and estimated_accuracy > 80 else '#6b7280'};">
+                <h4 style="margin: 0 0 10px 0; font-size: 14px; color: #374151;">🔄 传导模式验证（5个交易日前预测）</h4>
                 <div style="font-size: 12px; color: #6b7280; margin-bottom: 8px;">
-                    {date_label}验证情况：
+                    {prediction_date} 的1天和5天预测验证情况：
                 </div>
-                <div style="font-size: 14px; font-weight: 600; color: {'#166534' if transmission_info.get('transmission_mode') else '#374151'};">
+                <div style="font-size: 14px; font-weight: 600; color: {'#166534' if estimated_accuracy and estimated_accuracy > 80 else '#374151'};">
                     {transmission_display}
                 </div>
                 <div style="font-size: 11px; color: #9ca3af; margin-top: 8px;">
-                    传导律：当1天和5天预测都正确时，20天预测准确率提升5.53%
+                    传导律：1天正确→20天准确率82.37%，5天正确→80.18%，两者都正确→80.59%（基准80.77%）
                 </div>
             </div>
 """
@@ -1788,7 +1827,7 @@ class HSI_Predictor:
             content += """
             <div style="padding: 20px; background: #f8fafc; border-radius: 8px; text-align: center; color: #6b7280;">
                 📊 样本量不足，暂无统计数据<br>
-                <span style="font-size: 11px;">预计需要1-2周数据积累</span>
+                <span style="font-size: 11px;">三周期模式验证需要20个交易日数据积累</span>
             </div>
 """
 
@@ -2248,8 +2287,13 @@ class HSI_Predictor:
 
     def _check_hsi_transmission_mode(self, data_date):
         """
-        检查恒指传导模式：查看5个交易日前的预测验证情况
-        如果没有5个交易日前的预测，则显示当天的预测
+        检查恒指传导模式：查看5个交易日前的1天和5天预测验证情况
+        用于预估20天预测的准确率
+
+        验证逻辑：
+        - 1天预测：5个交易日前做的1天预测，现在可以验证
+        - 5天预测：5个交易日前做的5天预测，现在可以验证
+        - 20天预测：不显示验证结果（还没到验证时间），但根据1天和5天的验证结果预估准确率
 
         参数:
         - data_date: 当前报告日期
@@ -2261,27 +2305,30 @@ class HSI_Predictor:
 
         history_file = os.path.join(data_dir, 'hsi_prediction_history.json')
 
-        # 计算5个交易日前的日期
+        # 计算5个交易日前的日期（使用香港交易日历）
         current_date_str = data_date if isinstance(data_date, str) else data_date.strftime('%Y-%m-%d')
 
         try:
-            import akshare as ak
-            df = ak.tool_trade_date_hist_sina()
-            trading_dates = df['trade_date'].astype(str).tolist()
+            # 使用恒指历史数据获取香港实际交易日
+            import yfinance as yf
+            hsi = yf.Ticker("^HSI")
+            hsi_data = hsi.history(period="2mo", interval="1d")
+            trading_dates = [d.strftime('%Y-%m-%d') for d in hsi_data.index]
 
             if current_date_str in trading_dates:
                 current_idx = trading_dates.index(current_date_str)
             else:
+                # 找最近的交易日
                 for i, d in enumerate(trading_dates):
-                    if d >= current_date_str:
+                    if d <= current_date_str:
                         current_idx = i
+                    else:
                         break
-                else:
-                    current_idx = len(trading_dates) - 1
 
             target_idx = max(0, current_idx - 5)
             prediction_date = trading_dates[target_idx]
         except Exception as e:
+            print(f"⚠️ 获取香港交易日历失败: {e}，使用备用方案")
             if isinstance(data_date, str):
                 data_date_obj = datetime.strptime(data_date, '%Y-%m-%d')
             else:
@@ -2290,8 +2337,9 @@ class HSI_Predictor:
 
         if not os.path.exists(history_file):
             return {'transmission_mode': False, 'pred_1d_correct': None, 'pred_5d_correct': None,
-                    'pred_20d_correct': None, 'pred_1d_direction': None, 'pred_5d_direction': None,
-                    'pred_20d_direction': None, 'prediction_date': prediction_date}
+                    'pred_1d_direction': None, 'pred_5d_direction': None,
+                    'pred_20d_direction': None, 'prediction_date': prediction_date,
+                    'estimated_20d_accuracy': None}
 
         try:
             with open(history_file, 'r', encoding='utf-8') as f:
@@ -2299,7 +2347,7 @@ class HSI_Predictor:
 
             predictions = history.get('predictions', [])
 
-            # 先查找5个交易日前的预测
+            # 查找5个交易日前的预测
             pred_1d = None
             pred_5d = None
             pred_20d = None
@@ -2314,47 +2362,57 @@ class HSI_Predictor:
                     elif h == 20:
                         pred_20d = pred
 
-            # 如果5个交易日前没有预测，则查找当天的预测
-            use_current_date = False
-            if not (pred_1d and pred_5d and pred_20d):
-                for pred in predictions:
-                    if pred.get('data_date') == current_date_str:
-                        h = pred.get('horizon')
-                        if h == 1:
-                            pred_1d = pred
-                        elif h == 5:
-                            pred_5d = pred
-                        elif h == 20:
-                            pred_20d = pred
-                use_current_date = True
-                prediction_date = current_date_str
-
-            # 检查outcome字段
+            # 检查outcome字段（验证结果）
             pred_1d_correct = pred_1d.get('outcome') == 'correct' if pred_1d and pred_1d.get('outcome') else None
             pred_5d_correct = pred_5d.get('outcome') == 'correct' if pred_5d and pred_5d.get('outcome') else None
-            pred_20d_correct = pred_20d.get('outcome') == 'correct' if pred_20d and pred_20d.get('outcome') else None
+
+            # 根据1天和5天的验证结果，预估20天预测的准确率
+            # 最新传导律数据（2026-05-13 验证）：
+            # - 基准（无条件）：80.77%
+            # - 1天正确 → 20天也正确：82.37%
+            # - 5天正确 → 20天也正确：80.18%
+            # - 1天+5天都正确 → 20天也正确：80.59%
+            estimated_20d_accuracy = None
+            if pred_1d_correct is not None and pred_5d_correct is not None:
+                if pred_1d_correct and pred_5d_correct:
+                    # 1天和5天都正确
+                    estimated_20d_accuracy = 80.59  # 1+5天都正确 → 20天也正确
+                elif pred_1d_correct:
+                    # 只有1天正确
+                    estimated_20d_accuracy = 82.37  # 1天正确 → 20天也正确
+                elif pred_5d_correct:
+                    # 只有5天正确
+                    estimated_20d_accuracy = 80.18  # 5天正确 → 20天也正确
+                else:
+                    # 1天和5天都错误
+                    estimated_20d_accuracy = 80.77  # 基准准确率
 
             return {
                 'transmission_mode': pred_1d_correct and pred_5d_correct if pred_1d_correct is not None and pred_5d_correct is not None else False,
                 'pred_1d_correct': pred_1d_correct,
                 'pred_5d_correct': pred_5d_correct,
-                'pred_20d_correct': pred_20d_correct,
                 'pred_1d_direction': pred_1d.get('predicted_direction') if pred_1d else None,
                 'pred_5d_direction': pred_5d.get('predicted_direction') if pred_5d else None,
                 'pred_20d_direction': pred_20d.get('predicted_direction') if pred_20d else None,
                 'prediction_date': prediction_date,
-                'is_current_prediction': use_current_date
+                'estimated_20d_accuracy': estimated_20d_accuracy
             }
 
         except Exception as e:
             print(f"⚠️ 检查传导模式失败: {e}")
             return {'transmission_mode': False, 'pred_1d_correct': None, 'pred_5d_correct': None,
-                    'pred_20d_correct': None, 'pred_1d_direction': None, 'pred_5d_direction': None,
-                    'pred_20d_direction': None, 'prediction_date': prediction_date}
+                    'pred_1d_direction': None, 'pred_5d_direction': None,
+                    'pred_20d_direction': None, 'prediction_date': prediction_date,
+                    'estimated_20d_accuracy': None}
 
     def _format_transmission_display(self, transmission_info):
         """
         格式化传导模式显示字符串
+
+        显示逻辑：
+        - 显示5个交易日前的1天和5天预测验证结果
+        - 不显示20天验证结果（还没到验证时间）
+        - 显示预估的20天准确率
 
         参数:
         - transmission_info: _check_hsi_transmission_mode() 返回的字典
@@ -2367,13 +2425,12 @@ class HSI_Predictor:
         pred_20d_dir = transmission_info.get('pred_20d_direction')
         pred_1d_correct = transmission_info.get('pred_1d_correct')
         pred_5d_correct = transmission_info.get('pred_5d_correct')
-        pred_20d_correct = transmission_info.get('pred_20d_correct')
-        transmission_mode = transmission_info.get('transmission_mode')
+        estimated_20d_accuracy = transmission_info.get('estimated_20d_accuracy')
         prediction_date = transmission_info.get('prediction_date')
 
         # 如果没有预测数据
-        if pred_1d_dir is None and pred_5d_dir is None and pred_20d_dir is None:
-            return "暂无数据"
+        if pred_1d_dir is None and pred_5d_dir is None:
+            return "暂无历史预测数据"
 
         # 方向符号
         def get_dir_symbol(direction):
@@ -2399,27 +2456,29 @@ class HSI_Predictor:
 
         result_1d = get_result_symbol(pred_1d_correct)
         result_5d = get_result_symbol(pred_5d_correct)
-        result_20d = get_result_symbol(pred_20d_correct)
 
-        # 构建显示字符串
+        # 构建显示字符串（只显示1天和5天的验证结果）
         parts = []
         if pred_1d_dir is not None:
             parts.append(f"1天{dir_1d_symbol}{result_1d}")
         if pred_5d_dir is not None:
             parts.append(f"5天{dir_5d_symbol}{result_5d}")
-        if pred_20d_dir is not None:
-            parts.append(f"20天{dir_20d_symbol}{result_20d}")
 
         display = " ".join(parts)
 
         # 添加预测日期
         date_prefix = f"[{prediction_date}] " if prediction_date else ""
 
-        # 如果传导模式激活，添加标记
-        if transmission_mode:
-            display = f"✅传导({date_prefix}{display})"
-        else:
-            display = f"{date_prefix}{display}"
+        # 添加20天预测方向（不显示验证结果）和预估准确率
+        if pred_20d_dir is not None:
+            display += f" | 20天预测{dir_20d_symbol}"
+
+        # 添加预估准确率
+        if estimated_20d_accuracy is not None:
+            display += f" → 预估准确率 {estimated_20d_accuracy:.1f}%"
+
+        # 添加日期前缀
+        display = f"{date_prefix}{display}"
 
         return display if display else "-"
 
@@ -2566,11 +2625,11 @@ class HSI_Predictor:
             from catboost import CatBoostClassifier
 
             # 已知的历史准确率（基于 Walk-forward 验证）
-            # 更新时间：2026-04-28（恒指增强模型：33特征）
+            # 更新时间：2026-05-14（恒指增强模型：33特征）
             historical_accuracy = {
-                1: 0.4967,   # 49.67%（噪音大，仅供参考）
-                5: 0.6236,   # 62.36%（趋势确认）
-                20: 0.8124   # 81.24%（最可靠）
+                1: 0.5105,   # 51.05%（噪音大，仅供参考）
+                5: 0.6232,   # 62.32%（趋势确认）
+                20: 0.8066   # 80.66%（最可靠）
             }
 
             historical_auc = {
@@ -2580,16 +2639,16 @@ class HSI_Predictor:
             }
 
             # 八大模式的准确率（用于交易策略匹配）
-            # 更新时间：2026-04-28（最新验证）
+            # 更新时间：2026-05-14（最新验证）
             pattern_accuracy = {
-                '101': 95.00,  # 假突破（最优）
-                '010': 85.98,  # 反弹失败（次优）
-                '001': 84.00,  # 下跌中继
-                '111': 80.62,  # 一致看涨
-                '000': 79.57,  # 一致看跌
-                '110': 79.22,  # 震荡回调
-                '011': 79.10,  # 探底回升
-                '100': 74.34   # 冲高回落
+                '101': 88.61,  # 假突破（最优）
+                '001': 83.02,  # 下跌中继（次优）
+                '110': 82.93,  # 震荡回调
+                '000': 81.40,  # 一致看跌
+                '010': 80.95,  # 反弹失败
+                '011': 79.51,  # 探底回升
+                '100': 77.78,  # 冲高回落
+                '111': 75.66   # 一致看涨
             }
 
             results = {}
@@ -3062,29 +3121,40 @@ def verify_predictions():
                 # 目标日期已过，进行验证
                 try:
                     # 查找目标日期的收盘价
-                    target_date_pd = pd.to_datetime(target_date_str)
-                    if target_date_pd in hsi_data.index:
-                        actual_price = float(hsi_data.loc[target_date_pd, 'Close'])
+                    target_date_pd = pd.to_datetime(target_date_str).tz_localize(None)
+                    hsi_index_naive = hsi_data.index.tz_localize(None) if hsi_data.index.tzinfo else hsi_data.index
+
+                    # 使用字符串日期匹配
+                    target_date_str_for_match = target_date_pd.strftime('%Y-%m-%d')
+                    matching_rows = hsi_data[hsi_index_naive.strftime('%Y-%m-%d') == target_date_str_for_match]
+
+                    if not matching_rows.empty:
+                        actual_price = float(matching_rows.iloc[0]['Close'])
                     else:
                         # 找最近的交易日
-                        mask = hsi_data.index <= target_date_pd
+                        mask = hsi_index_naive <= target_date_pd
                         if mask.any():
                             actual_price = float(hsi_data[mask].iloc[-1]['Close'])
                         else:
                             updated_predictions.append(pred)
                             continue
 
-                    # 获取预测时的价格
-                    prediction_price = pred.get('current_price', 0)
+                    # 获取预测时的价格（兼容 entry_price 和 current_price）
+                    prediction_price = pred.get('entry_price') or pred.get('current_price', 0)
 
                     # 计算实际收益
                     actual_return = (actual_price - prediction_price) / prediction_price
-                    actual_direction = 1 if actual_return > 0 else 0
+                    actual_direction_str = 'up' if actual_return > 0 else 'down'
+
+                    # 判断预测是否正确
+                    predicted_direction = pred.get('predicted_direction', '')
+                    is_correct = (predicted_direction == actual_direction_str)
 
                     # 更新预测记录
                     pred['verified'] = True
                     pred['actual_return'] = float(actual_return)
-                    pred['actual_direction'] = actual_direction
+                    pred['actual_direction'] = actual_direction_str
+                    pred['outcome'] = 'correct' if is_correct else 'incorrect'
 
                     # 验证评分模型（兼容新旧格式）
                     score_model = pred.get('score_model', {})
@@ -3109,12 +3179,13 @@ def verify_predictions():
                         catboost_pred = catboost_model.get('trend')
                         catboost_predicted_direction = 1 if catboost_pred == '上涨' else 0
                         catboost_total += 1
-                        if catboost_predicted_direction == actual_direction:
+                        if catboost_predicted_direction == (1 if actual_direction_str == 'up' else 0):
                             catboost_correct += 1
 
                     verified_count += 1
                     print(f"✅ 验证: {prediction_date_str} → {target_date_str}")
-                    print(f"   实际收益: {actual_return*100:.2f}%, 方向: {'上涨' if actual_direction == 1 else '下跌'}")
+                    print(f"   实际收益: {actual_return*100:.2f}%, 方向: {'上涨' if actual_direction_str == 'up' else '下跌'}")
+                    print(f"   预测方向: {predicted_direction}, 结果: {'✓ 正确' if is_correct else '✗ 错误'}")
 
                 except Exception as e:
                     print(f"⚠️ 验证失败 {prediction_date_str}: {e}")

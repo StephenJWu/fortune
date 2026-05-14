@@ -57,14 +57,14 @@ SEARCH_SPACE = {
     'colsample_bylevel': [0.6, 0.7, 0.75, 0.8]
 }
 
-# 当前最优参数（基准）
+# 当前最优参数（基准）- 2026-05-08 系统调优结果
 BASELINE_PARAMS = {
-    'n_estimators': 600,
+    'n_estimators': 400,
     'depth': 7,
-    'learning_rate': 0.03,
+    'learning_rate': 0.04,
     'l2_leaf_reg': 2,
     'subsample': 0.75,
-    'colsample_bylevel': 0.75
+    'colsample_bylevel': 0.6
 }
 
 
@@ -76,7 +76,9 @@ class HyperparameterTuner:
         horizon: int = 20,
         n_folds: int = 6,
         quick_mode: bool = False,
-        full_mode: bool = False
+        full_mode: bool = False,
+        use_feature_selection: bool = False,
+        top_k: int = 300
     ):
         """
         初始化调优器
@@ -86,11 +88,15 @@ class HyperparameterTuner:
             n_folds: 验证fold数量
             quick_mode: 快速模式（更少股票和fold）
             full_mode: 完整模式（使用全部股票）
+            use_feature_selection: 是否使用特征选择
+            top_k: 特征选择数量
         """
         self.horizon = horizon
         self.n_folds = n_folds
         self.quick_mode = quick_mode
         self.full_mode = full_mode
+        self.use_feature_selection = use_feature_selection
+        self.top_k = top_k
 
         # 根据模式配置
         if quick_mode:
@@ -111,6 +117,27 @@ class HyperparameterTuner:
         logger.info(f"验证fold数: {self.n_folds}")
         logger.info(f"股票数量: {self.n_stocks}")
         logger.info(f"模式: {'快速' if quick_mode else '完整' if full_mode else '标准'}")
+        if use_feature_selection:
+            logger.info(f"特征选择: Top {top_k}")
+
+        # 预加载社区 ID（确保训练/预测一致性）
+        self.preloaded_community_ids = None
+        network_features_file = 'output/network_features_for_ml.json'
+        if os.path.exists(network_features_file):
+            try:
+                with open(network_features_file, 'r') as f:
+                    network_features_data = json.load(f)
+                all_community_ids = set()
+                for stock_code, net_features in network_features_data.items():
+                    if 'net_community_id' in net_features:
+                        comm_id = net_features['net_community_id']
+                        if comm_id >= 0:
+                            all_community_ids.add(int(comm_id))
+                if all_community_ids:
+                    self.preloaded_community_ids = sorted(list(all_community_ids))
+                    logger.info(f"预加载社区 ID: {self.preloaded_community_ids}")
+            except Exception as e:
+                logger.warning(f"预加载网络特征失败: {e}")
 
     def evaluate_params(self, params: dict, stock_list: list) -> dict:
         """
@@ -135,7 +162,8 @@ class HyperparameterTuner:
             train_data = model.prepare_data(
                 selected_stocks,
                 horizon=self.horizon,
-                for_backtest=False
+                for_backtest=False,
+                community_ids=self.preloaded_community_ids  # 使用预加载的社区 ID
             )
 
             if len(train_data) < 200:
@@ -147,11 +175,37 @@ class HyperparameterTuner:
                            'Vol_MA20', 'MA5', 'MA10', 'MA20', 'MA50', 'MA100', 'MA200',
                            'BB_upper', 'BB_lower', 'BB_middle', 'Low_Min', 'High_Max',
                            '+DM', '-DM', '+DI', '-DI', 'TP', 'MF_Multiplier', 'MF_Volume']
-            feature_cols = [c for c in train_data.columns if c not in exclude_cols
+            all_feature_cols = [c for c in train_data.columns if c not in exclude_cols
                            and train_data[c].dtype in ['float64', 'float32', 'int64', 'int32']]
 
-            if len(feature_cols) == 0:
+            if len(all_feature_cols) == 0:
                 return {'score': -999, 'accuracy': 0, 'sharpe': 0, 'error': '无特征'}
+
+            # 特征选择（如果启用）
+            if self.use_feature_selection:
+                # 加载特征选择结果
+                feature_selection_file = f'data/feature_selection_top{self.top_k}_horizon{self.horizon}.json'
+                if os.path.exists(feature_selection_file):
+                    try:
+                        with open(feature_selection_file, 'r') as f:
+                            selected_features = json.load(f).get('selected_features', [])
+                        if selected_features:
+                            feature_cols = [f for f in selected_features if f in all_feature_cols]
+                            if len(feature_cols) < 10:
+                                feature_cols = all_feature_cols
+                            else:
+                                logger.debug(f"使用 Top {len(feature_cols)} 特征")
+                        else:
+                            feature_cols = all_feature_cols
+                    except Exception as e:
+                        logger.warning(f"加载特征选择失败: {e}")
+                        feature_cols = all_feature_cols
+                else:
+                    # 如果没有特征选择文件，使用统计方法快速选择
+                    logger.info(f"特征选择文件不存在，使用快速统计方法选择 Top {self.top_k}")
+                    feature_cols = self._quick_feature_selection(train_data, all_feature_cols)
+            else:
+                feature_cols = all_feature_cols
 
             # 使用 Walk-forward 风格验证
             total_samples = len(train_data)
@@ -210,12 +264,22 @@ class HyperparameterTuner:
                 # 计算指标
                 accuracy = (y_pred == y_val).mean()
 
-                # 计算夏普比率
+                # 计算夏普比率（修正版：考虑持有期调整）
+                # 修正说明：Future_Return 是 horizon 天持有期的收益，不是日收益
+                # 年化因子应考虑持有期：一年约252个交易日，horizon天持有期可做 252/horizon 次交易
                 if 'Future_Return' in val_df.columns:
                     returns = val_df['Future_Return'].values
                     strategy_returns = returns * (2 * y_pred - 1)
                     if len(strategy_returns) > 0 and np.std(strategy_returns) > 0:
-                        sharpe = np.mean(strategy_returns) / np.std(strategy_returns) * np.sqrt(252)
+                        # 持有期调整因子
+                        holding_period_factor = 252 / self.horizon
+                        # 年化收益
+                        annualized_return = np.mean(strategy_returns) * holding_period_factor
+                        # 年化波动率
+                        annualized_std = np.std(strategy_returns) * np.sqrt(holding_period_factor)
+                        # 夏普比率（扣除无风险利率）
+                        risk_free_rate = 0.02
+                        sharpe = (annualized_return - risk_free_rate) / annualized_std if annualized_std > 0 else 0
                     else:
                         sharpe = 0
                 else:
@@ -256,6 +320,46 @@ class HyperparameterTuner:
         except Exception as e:
             logger.error(f"参数评估失败: {e}")
             return {'score': -999, 'accuracy': 0, 'sharpe': 0, 'error': str(e)}
+
+    def _quick_feature_selection(self, df: pd.DataFrame, feature_cols: list) -> list:
+        """
+        快速特征选择（基于统计方法）
+
+        Args:
+            df: 数据框
+            feature_cols: 特征列列表
+
+        Returns:
+            list: 选择的特征列
+        """
+        from scipy import stats
+
+        if 'Label' not in df.columns:
+            return feature_cols[:self.top_k]
+
+        # 计算每个特征与标签的相关性
+        correlations = {}
+        for col in feature_cols:
+            try:
+                # 使用点二列相关系数
+                valid_mask = df[col].notna() & df['Label'].notna()
+                if valid_mask.sum() > 50:
+                    corr, _ = stats.pointbiserialr(
+                        df.loc[valid_mask, 'Label'],
+                        df.loc[valid_mask, col]
+                    )
+                    if not np.isnan(corr):
+                        correlations[col] = abs(corr)
+            except Exception:
+                continue
+
+        # 按相关性排序，选择 Top K
+        if correlations:
+            sorted_features = sorted(correlations.keys(), key=lambda x: correlations[x], reverse=True)
+            selected = sorted_features[:self.top_k]
+            return selected
+        else:
+            return feature_cols[:self.top_k]
 
     def random_search(self, n_iter: int = 30, stock_list: list = None) -> dict:
         """
@@ -444,6 +548,10 @@ def main():
                         help='输出目录 (默认: output)')
     parser.add_argument('--skip-final', action='store_true',
                         help='跳过最终验证')
+    parser.add_argument('--use-feature-selection', action='store_true',
+                        help='使用特征选择（Top 300）')
+    parser.add_argument('--top-k', type=int, default=300,
+                        help='特征选择数量 (默认: 300)')
 
     args = parser.parse_args()
 
@@ -453,6 +561,8 @@ def main():
     print(f"迭代次数: {args.n_iter}")
     print(f"预测周期: {args.horizon}天")
     print(f"模式: {'快速' if args.quick else '完整' if args.full else '标准'}")
+    if args.use_feature_selection:
+        print(f"特征选择: Top {args.top_k}")
     print(f"输出目录: {args.output_dir}")
     print("="*80)
 
@@ -460,7 +570,9 @@ def main():
     tuner = HyperparameterTuner(
         horizon=args.horizon,
         quick_mode=args.quick,
-        full_mode=args.full
+        full_mode=args.full,
+        use_feature_selection=args.use_feature_selection,
+        top_k=args.top_k
     )
 
     # 执行调优

@@ -37,8 +37,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 warnings.filterwarnings('ignore')
 
 # 导入项目模块
-from ml_services.ml_trading_model import CatBoostModel, CatBoostRankerModel, LightGBMModel, GBDTModel, FeatureEngineer
+from ml_services.ml_trading_model import CatBoostModel, LightGBMModel, GBDTModel, FeatureEngineer
 from ml_services.logger_config import get_logger
+from ml_services.market_regime import MarketSentimentFilter
 from config import TRAINING_STOCKS as STOCK_LIST
 
 # 获取日志记录器
@@ -58,20 +59,13 @@ class WalkForwardValidator:
         confidence_threshold: float = 0.55,
         use_feature_selection: bool = True,
         min_train_samples: int = 100,
-        # 新增：Regime Shift 修复参数
-        use_monotone_constraints: bool = True,
-        time_decay_lambda: float = 0.5,
-        use_rolling_percentile: bool = False,  # 2026-05-02: 关闭滚动百分位（消融实验证明其降低IC）
-        use_cross_sectional_percentile: bool = True,  # 2026-05-03: 截面百分位（与相对标签匹配）
-        use_cross_sectional_zscore: bool = True,  # 2026-05-03: 截面 Z-Score（解决时间序列基准问题）
-        feature_importance_threshold: float = 0.0,  # P3-8: 特征修剪阈值
-        n_jobs: int = 1,  # 并行执行的 fold 数量（-1 表示使用所有 CPU 核心）
+        fp_penalty: float = None           # False Positive 惩罚系数（非对称损失函数）
     ):
         """
         初始化 Walk-forward 验证器
 
         Args:
-            model_type: 模型类型（catboost、lightgbm、gbdt、catboost_ranker）
+            model_type: 模型类型（catboost、lightgbm、gbdt）
             train_window_months: 训练窗口（月）
             test_window_months: 测试窗口（月）
             step_window_months: 滚动步长（月）
@@ -79,13 +73,9 @@ class WalkForwardValidator:
             confidence_threshold: 置信度阈值
             use_feature_selection: 是否使用特征选择
             min_train_samples: 最小训练样本数
-            use_monotone_constraints: 是否使用单调约束（防止特征方向翻转，推荐开启）
-            time_decay_lambda: 时间衰减系数（0=无衰减，0.5=默认）
-            use_rolling_percentile: 是否使用滚动百分位特征（已关闭，消融实验证明降低IC）
-            use_cross_sectional_percentile: 是否使用截面百分位特征（与相对标签匹配）
-            use_cross_sectional_zscore: 是否使用截面 Z-Score 特征（解决时间序列基准问题）
-            feature_importance_threshold: 特征重要性阈值，低于此值的特征将被移除（0=不修剪）
-            n_jobs: 并行执行的 fold 数量（-1 表示使用所有 CPU 核心，1 表示顺序执行）
+            fp_penalty: False Positive 惩罚系数（非对称损失函数）
+                - None: 不使用额外惩罚
+                - float (如 2.5): 对类别0（下跌）施加 fp_penalty 倍惩罚
         """
         self.model_type = model_type.lower()
         self.train_window_months = train_window_months
@@ -95,19 +85,11 @@ class WalkForwardValidator:
         self.confidence_threshold = confidence_threshold
         self.use_feature_selection = use_feature_selection
         self.min_train_samples = min_train_samples
-        # 新增参数
-        self.use_monotone_constraints = use_monotone_constraints
-        self.time_decay_lambda = time_decay_lambda
-        self.use_rolling_percentile = use_rolling_percentile
-        self.use_cross_sectional_percentile = use_cross_sectional_percentile
-        self.use_cross_sectional_zscore = use_cross_sectional_zscore
-        self.feature_importance_threshold = feature_importance_threshold  # P3-8
-        self.n_jobs = n_jobs
+        self.fp_penalty = fp_penalty
 
         # 模型类映射
         self.model_classes = {
             'catboost': CatBoostModel,
-            'catboost_ranker': CatBoostRankerModel,  # P3-9: 排序模型
             'lightgbm': LightGBMModel,
             'gbdt': GBDTModel
         }
@@ -118,13 +100,37 @@ class WalkForwardValidator:
         self.model_class = self.model_classes[self.model_type]
         self.feature_engineer = FeatureEngineer()
 
+        # 市场情绪过滤器（使用滞后数据避免前瞻性偏差）
+        self.market_filter = None
+        self.use_market_filter = True  # 默认启用
+
         logger.info(f"初始化 Walk-forward 验证器")
         logger.info(f"模型类型: {self.model_type}")
         logger.info(f"训练窗口: {train_window_months} 个月")
         logger.info(f"测试窗口: {test_window_months} 个月")
         logger.info(f"滚动步长: {step_window_months} 个月")
         logger.info(f"预测周期: {horizon} 天")
-        logger.info(f"单调约束: {use_monotone_constraints}, 时间衰减: {time_decay_lambda}, 滚动百分位: {use_rolling_percentile}, 截面百分位: {use_cross_sectional_percentile}, 截面ZScore: {use_cross_sectional_zscore}")
+        if self.fp_penalty is not None:
+            logger.info(f"非对称损失函数: FP惩罚={self.fp_penalty}x")
+
+        # 预加载社区 ID（确保训练/预测一致性）
+        self.preloaded_community_ids = None
+        network_features_file = 'output/network_features_for_ml.json'
+        if os.path.exists(network_features_file):
+            try:
+                with open(network_features_file, 'r') as f:
+                    network_features_data = json.load(f)
+                all_community_ids = set()
+                for stock_code, net_features in network_features_data.items():
+                    if 'net_community_id' in net_features:
+                        comm_id = net_features['net_community_id']
+                        if comm_id >= 0:
+                            all_community_ids.add(int(comm_id))
+                if all_community_ids:
+                    self.preloaded_community_ids = sorted(list(all_community_ids))
+                    logger.info(f"预加载社区 ID: {self.preloaded_community_ids}")
+            except Exception as e:
+                logger.warning(f"预加载网络特征失败: {e}")
 
     def validate(self, stock_list, start_date, end_date):
         """
@@ -168,12 +174,17 @@ class WalkForwardValidator:
             raise ValueError(f"日期范围不足，需要至少 {self.train_window_months + self.test_window_months} 个月的数据")
 
         print(f"\nFold 数量: {num_folds}")
-        print(f"并行执行: {self.n_jobs if self.n_jobs > 0 else '所有可用核心'} 个 fold")
         print("="*80)
 
-        # 准备所有 fold 的参数
-        fold_params = []
+        # 存储所有fold的结果
+        all_fold_results = []
+
+        # 执行每个fold的验证
         for fold in range(num_folds):
+            print(f"\n{'='*80}")
+            print(f"📊 Fold {fold + 1}/{num_folds}")
+            print(f"{'='*80}")
+
             # 计算训练和测试期间
             train_start_idx = fold * self.step_window_months
             train_end_idx = train_start_idx + self.train_window_months
@@ -190,77 +201,37 @@ class WalkForwardValidator:
             test_start_date = pd.to_datetime(test_months[0] + '-01').tz_localize('UTC')
             test_end_date = (pd.to_datetime(test_months[-1] + '-01') + pd.DateOffset(months=1) - pd.DateOffset(days=1)).tz_localize('UTC')
 
-            fold_params.append({
-                'fold': fold,
-                'train_start_date': train_start_date,
-                'train_end_date': train_end_date,
-                'test_start_date': test_start_date,
-                'test_end_date': test_end_date,
-            })
+            print(f"训练期间: {train_start_date.strftime('%Y-%m-%d')} 至 {train_end_date.strftime('%Y-%m-%d')}")
+            print(f"测试期间: {test_start_date.strftime('%Y-%m-%d')} 至 {test_end_date.strftime('%Y-%m-%d')}")
 
-        # 执行验证（并行或顺序）
-        all_fold_results = []
-        if self.n_jobs != 1 and num_folds > 1:
-            # 并行执行
-            from joblib import Parallel, delayed
-            print(f"\n🚀 并行执行 {num_folds} 个 fold...")
-
-            results = Parallel(
-                n_jobs=self.n_jobs,
-                verbose=10,  # 显示进度
-                backend='loky'  # 使用 loky 后端，支持多进程
-            )(
-                delayed(self._validate_fold_wrapper)(
+            # 执行fold验证
+            try:
+                fold_result = self._validate_fold(
                     stock_list,
-                    params['train_start_date'],
-                    params['train_end_date'],
-                    params['test_start_date'],
-                    params['test_end_date'],
-                    params['fold'],
-                    num_folds
+                    train_start_date,
+                    train_end_date,
+                    test_start_date,
+                    test_end_date,
+                    fold
                 )
-                for params in fold_params
-            )
 
-            # 过滤失败的结果
-            all_fold_results = [r for r in results if r is not None]
-        else:
-            # 顺序执行（原有逻辑）
-            for params in fold_params:
-                fold = params['fold']
-                print(f"\n{'='*80}")
-                print(f"📊 Fold {fold + 1}/{num_folds}")
-                print(f"{'='*80}")
-                print(f"训练期间: {params['train_start_date'].strftime('%Y-%m-%d')} 至 {params['train_end_date'].strftime('%Y-%m-%d')}")
-                print(f"测试期间: {params['test_start_date'].strftime('%Y-%m-%d')} 至 {params['test_end_date'].strftime('%Y-%m-%d')}")
+                all_fold_results.append(fold_result)
 
-                try:
-                    fold_result = self._validate_fold(
-                        stock_list,
-                        params['train_start_date'],
-                        params['train_end_date'],
-                        params['test_start_date'],
-                        params['test_end_date'],
-                        fold
-                    )
+                # 打印fold结果
+                print(f"\n✅ Fold {fold + 1} 结果:")
+                print(f"  样本数: {fold_result['num_samples']}")
+                print(f"  交易次数: {fold_result.get('num_trades', 'N/A')}")
+                print(f"  平均收益率: {fold_result['avg_return']:.2%}")
+                print(f"  胜率: {fold_result['win_rate']:.2%}")
+                print(f"  准确率: {fold_result['accuracy']:.2%}")
+                print(f"  夏普比率: {fold_result['sharpe_ratio']:.4f}")
+                print(f"  最大回撤: {fold_result['max_drawdown']:.2%}")
 
-                    all_fold_results.append(fold_result)
-
-                    # 打印fold结果
-                    print(f"\n✅ Fold {fold + 1} 结果:")
-                    print(f"  样本数: {fold_result['num_samples']}")
-                    print(f"  交易次数: {fold_result.get('num_trades', 'N/A')}")
-                    print(f"  平均收益率: {fold_result['avg_return']:.2%}")
-                    print(f"  胜率: {fold_result['win_rate']:.2%}")
-                    print(f"  准确率: {fold_result['accuracy']:.2%}")
-                    print(f"  夏普比率: {fold_result['sharpe_ratio']:.4f}")
-                    print(f"  最大回撤: {fold_result['max_drawdown']:.2%}")
-
-                except Exception as e:
-                    logger.error(f"Fold {fold + 1} 验证失败: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    continue
+            except Exception as e:
+                logger.error(f"Fold {fold + 1} 验证失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                continue
 
         # 计算整体指标
         overall_result = self._calculate_overall_metrics(all_fold_results)
@@ -305,56 +276,6 @@ class WalkForwardValidator:
 
         return report
 
-    def _validate_fold_wrapper(self, stock_list, train_start_date, train_end_date, test_start_date, test_end_date, fold, total_folds):
-        """
-        并行执行的 fold 验证包装器
-
-        Args:
-            stock_list: 股票代码列表
-            train_start_date: 训练开始日期
-            train_end_date: 训练结束日期
-            test_start_date: 测试开始日期
-            test_end_date: 测试结束日期
-            fold: fold编号
-            total_folds: 总fold数
-
-        Returns:
-            dict: fold验证结果，失败时返回 None
-        """
-        print(f"\n{'='*80}")
-        print(f"📊 Fold {fold + 1}/{total_folds}")
-        print(f"{'='*80}")
-        print(f"训练期间: {train_start_date.strftime('%Y-%m-%d')} 至 {train_end_date.strftime('%Y-%m-%d')}")
-        print(f"测试期间: {test_start_date.strftime('%Y-%m-%d')} 至 {test_end_date.strftime('%Y-%m-%d')}")
-
-        try:
-            fold_result = self._validate_fold(
-                stock_list,
-                train_start_date,
-                train_end_date,
-                test_start_date,
-                test_end_date,
-                fold
-            )
-
-            # 打印fold结果
-            print(f"\n✅ Fold {fold + 1} 结果:")
-            print(f"  样本数: {fold_result['num_samples']}")
-            print(f"  交易次数: {fold_result.get('num_trades', 'N/A')}")
-            print(f"  平均收益率: {fold_result['avg_return']:.2%}")
-            print(f"  胜率: {fold_result['win_rate']:.2%}")
-            print(f"  准确率: {fold_result['accuracy']:.2%}")
-            print(f"  夏普比率: {fold_result['sharpe_ratio']:.4f}")
-            print(f"  最大回撤: {fold_result['max_drawdown']:.2%}")
-
-            return fold_result
-
-        except Exception as e:
-            logger.error(f"Fold {fold + 1} 验证失败: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
     def _validate_fold(self, stock_list, train_start_date, train_end_date, test_start_date, test_end_date, fold):
         """
         验证单个fold
@@ -372,31 +293,10 @@ class WalkForwardValidator:
         """
         print(f"\n  🔄 准备训练数据...")
 
-        # 创建模型实例（传递 Regime Shift 修复参数）
-        if self.model_type == 'catboost':
-            model = self.model_class(
-                use_monotone_constraints=self.use_monotone_constraints,
-                time_decay_lambda=self.time_decay_lambda,
-                use_rolling_percentile=self.use_rolling_percentile,
-                use_cross_sectional_percentile=self.use_cross_sectional_percentile,
-                use_cross_sectional_zscore=self.use_cross_sectional_zscore,
-                feature_importance_threshold=self.feature_importance_threshold  # P3-8
-            )
-        elif self.model_type == 'catboost_ranker':
-            # P3-9: 排序模型
-            # P10-1: 使用 YetiRank 损失函数（全局排序，直接优化 Rank IC）
-            # P4-10/P9: YetiRankPairwise 导致 IC 正但 Rank IC 负，尝试 YetiRank 改善
-            # P5: 软标签实验失败（IC/Rank IC 双降），已放弃
-            model = self.model_class(
-                loss_function='YetiRank',
-                use_monotone_constraints=self.use_monotone_constraints,
-                time_decay_lambda=self.time_decay_lambda,
-                use_rolling_percentile=self.use_rolling_percentile,
-                use_cross_sectional_percentile=self.use_cross_sectional_percentile,
-                use_cross_sectional_zscore=self.use_cross_sectional_zscore,
-                feature_importance_threshold=self.feature_importance_threshold,
-                use_soft_label=False  # P5: 软标签实验失败，回退到原始收益率
-            )
+        # 创建模型实例（支持非对称损失函数）
+        if self.fp_penalty is not None:
+            model = self.model_class(fp_penalty=self.fp_penalty)
+            print(f"  ⚠️ 使用非对称损失函数: FP惩罚={self.fp_penalty}x")
         else:
             model = self.model_class()
 
@@ -407,21 +307,16 @@ class WalkForwardValidator:
             start_date=train_start_date,
             end_date=train_end_date,
             horizon=self.horizon,
-            for_backtest=False
+            for_backtest=False,
+            community_ids=self.preloaded_community_ids  # 使用预加载的社区 ID
         )
 
         # 检查训练样本数量
         if len(train_data) < self.min_train_samples:
             raise ValueError(f"训练样本不足: {len(train_data)} < {self.min_train_samples}")
 
-        # 检查目标变量多样性（排序模型使用 Future_Return，跳过 Label 检查）
-        if self.model_type == 'catboost_ranker':
-            # 排序模型使用 Future_Return 作为标签，检查 Future_Return 存在性
-            if 'Future_Return' not in train_data.columns:
-                raise ValueError("训练数据中没有 'Future_Return' 列")
-            if train_data['Future_Return'].isna().all():
-                raise ValueError("Future_Return 全为 NaN")
-        elif 'Label' in train_data.columns:
+        # 检查目标变量多样性
+        if 'Label' in train_data.columns:
             unique_labels = train_data['Label'].nunique()
             if unique_labels < 2:
                 raise ValueError(f"目标变量多样性不足：只有 {unique_labels} 个唯一值，需要至少 2 个（上涨/下跌）")
@@ -440,22 +335,21 @@ class WalkForwardValidator:
                 horizon=self.horizon,
                 use_feature_selection=self.use_feature_selection
             )
-            # P9: 保存最后一个训练的模型引用（用于 save_detailed_results）
-            self.last_model = model
         except Exception as e:
             logger.error(f"模型训练失败: {e}")
             raise
 
         print(f"  ✅ 模型训练完成")
 
-        # 准备测试数据
+        # 准备测试数据（使用训练时保存的社区 ID，确保特征一致性）
         print(f"  🔄 准备测试数据...")
         test_data = model.prepare_data(
             train_codes,
             start_date=test_start_date,
             end_date=test_end_date,
             horizon=self.horizon,
-            for_backtest=False
+            for_backtest=False,
+            community_ids=model.community_ids  # 使用训练时的社区 ID
         )
 
         print(f"  ✅ 测试数据准备完成: {len(test_data)} 条记录")
@@ -463,44 +357,14 @@ class WalkForwardValidator:
         # 生成预测（使用 predict_proba 方法批量预测）
         print(f"  🔄 生成预测...")
         X_test = test_data[model.feature_columns]
+        prediction_proba = model.predict_proba(X_test)
 
-        # 对 Ranker 模型使用自动温度参数，扩大概率分布范围
-        if hasattr(model, 'model_type') and model.model_type == 'catboost_ranker':
-            prediction_proba = model.predict_proba(X_test, temperature='auto')
-        else:
-            prediction_proba = model.predict_proba(X_test)
-        
-        # 根据市场状态使用自适应置信度阈值（符合业界标准）
-        base_threshold = self.confidence_threshold
-        
-        # 检查测试数据中是否有市场状态特征
-        if 'Confidence_Threshold_Multiplier' in test_data.columns:
-            # 使用特征中的动态阈值乘数
-            multipliers = test_data['Confidence_Threshold_Multiplier'].values
-            adaptive_thresholds = base_threshold * multipliers
-        elif 'Market_Regime' in test_data.columns:
-            # 根据市场状态计算阈值
-            regime_multipliers = {
-                'ranging': 1.09,    # 震荡市更严格
-                'normal': 1.0,      # 正常市标准
-                'trending': 0.91    # 趋势市更宽松
-            }
-            multipliers = test_data['Market_Regime'].map(regime_multipliers).fillna(1.0).values
-            adaptive_thresholds = base_threshold * multipliers
-        elif 'Market_Regime_Encoded' in test_data.columns:
-            # 使用数值编码的市场状态
-            regime_map = {0: 1.09, 1: 1.0, 2: 0.91}  # ranging, normal, trending
-            multipliers = test_data['Market_Regime_Encoded'].map(regime_map).fillna(1.0).values
-            adaptive_thresholds = base_threshold * multipliers
-        else:
-            # 无市场状态信息，使用固定阈值
-            adaptive_thresholds = np.full(len(prediction_proba), base_threshold)
-        
-        # 根据自适应阈值生成预测标签
+        # 使用标准阈值 0.5 生成初始预测（与 comprehensive_analysis.py 一致）
+        # 市场情绪过滤器会在后续步骤中应用动态阈值
         predictions = pd.DataFrame({
-            'prediction': (prediction_proba[:, 1] >= adaptive_thresholds).astype(int),
+            'prediction': (prediction_proba[:, 1] >= 0.5).astype(int),
             'probability': prediction_proba[:, 1],
-            'adaptive_threshold': adaptive_thresholds
+            'adaptive_threshold': np.full(len(prediction_proba), 0.5)  # 固定阈值，后续由市场情绪过滤器调整
         }, index=test_data.index)
         
         # 添加 Code 列（从列中提取）
@@ -511,6 +375,10 @@ class WalkForwardValidator:
             predictions['Code'] = [train_codes[0]] * len(predictions)  # 单股票情况下使用第一个股票代码
         
         print(f"  ✅ 预测生成完成 ({len(predictions)} 条预测)")
+
+        # ========== 应用市场情绪过滤器 ==========
+        if self.use_market_filter:
+            predictions = self._apply_market_filter(test_data, predictions, fold)
 
         # 计算评估指标
         print(f"  🔄 计算评估指标...")
@@ -525,7 +393,114 @@ class WalkForwardValidator:
         metrics['num_train_samples'] = len(train_data)
         metrics['num_test_samples'] = len(test_data)
 
+        # 获取特征重要性（Top 20）
+        try:
+            if hasattr(model, 'catboost_model') and model.catboost_model is not None:
+                feat_imp = pd.DataFrame({
+                    'Feature': model.feature_columns,
+                    'Importance': model.catboost_model.feature_importances_
+                })
+                feat_imp = feat_imp.sort_values('Importance', ascending=False)
+                # 保存 Top 100 特征重要性
+                top_features = feat_imp.head(100).to_dict('records')
+                metrics['top_features'] = [
+                    {'feature': r['Feature'], 'importance': round(r['Importance'], 4)}
+                    for r in top_features
+                ]
+                print(f"  ✅ 特征重要性已记录 (Top 100)")
+        except Exception as e:
+            logger.warning(f"获取特征重要性失败: {e}")
+            metrics['top_features'] = []
+
         return metrics
+
+    def _apply_market_filter(self, test_data, predictions, fold):
+        """
+        应用市场情绪过滤器
+
+        使用滞后1天的市场上涨比例动态调整预测阈值，
+        在极端市场环境时提高门槛，减少 False Positive。
+
+        Args:
+            test_data: 测试数据
+            predictions: 预测结果
+            fold: fold编号
+
+        Returns:
+            pd.DataFrame: 过滤后的预测结果
+        """
+        print(f"  🔄 应用市场情绪过滤器...")
+
+        # 初始化市场过滤器（首次调用时）
+        if self.market_filter is None:
+            self.market_filter = MarketSentimentFilter(lookback_days=1)
+
+        # 每个 fold 都需要准备市场收益率数据（因为日期范围不同）
+        # 关键：使用所有股票的收益率数据，按日期计算上涨比例
+        # 不能只使用单只股票的 Return_1d，需要聚合所有股票
+
+        # 从 test_data 中提取所有股票的收益率数据
+        if 'Return_1d' in test_data.columns:
+            # 使用 reset_index 避免索引和列名冲突
+            # 关键：直接传入原始收益率数据，让 prepare_market_schedule 内部进行 groupby
+            # 不要在这里预先计算上涨比例，否则 prepare_market_schedule 会再次 groupby 导致错误
+            returns_df = test_data[['Return_1d']].reset_index()
+            returns_df.columns = ['Date', 'Return_1d']
+
+            self.market_filter.prepare_market_schedule(
+                returns_df,
+                date_col='Date',
+                ret_col='Return_1d'
+            )
+        elif 'Close' in test_data.columns:
+            # 计算收益率
+            returns_df = test_data[['Close']].reset_index()
+            returns_df.columns = ['Date', 'Close']
+            returns_df['Return_1d'] = returns_df['Close'].pct_change()
+
+            # 直接传入收益率数据
+            self.market_filter.prepare_market_schedule(
+                returns_df[['Date', 'Return_1d']],
+                date_col='Date',
+                ret_col='Return_1d'
+            )
+        else:
+            logger.warning("无法准备市场情绪数据，跳过过滤")
+            return predictions
+
+        # 构建预测 DataFrame
+        pred_df = predictions.copy()
+        pred_df['Date'] = predictions.index
+        pred_df['Predict_Prob'] = predictions['probability']
+        pred_df['Predict_Direction'] = predictions['prediction'].map({1: 'UP', 0: 'DOWN'})
+
+        # 应用过滤
+        filtered_df = self.market_filter.apply_filter(
+            pred_df,
+            date_col='Date',
+            prob_col='Predict_Prob',
+            direction_col='Predict_Direction'
+        )
+
+        # 更新预测结果
+        predictions['market_up_ratio_lag1'] = filtered_df['market_up_ratio_lag1'].values
+        predictions['dynamic_threshold'] = filtered_df['dynamic_threshold'].values
+        predictions['market_layer'] = filtered_df['market_layer'].values
+        predictions['filtered_signal'] = filtered_df['filtered_signal'].values
+
+        # 统计过滤效果
+        original_signals = (predictions['prediction'] == 1).sum()
+        filtered_signals = predictions['filtered_signal'].sum()
+        reduction_pct = (original_signals - filtered_signals) / original_signals if original_signals > 0 else 0
+
+        print(f"  ✅ 市场情绪过滤完成")
+        print(f"     原始信号: {original_signals}, 过滤后: {filtered_signals}, 减少: {reduction_pct:.1%}")
+
+        # 统计各层级分布
+        layer_counts = predictions['market_layer'].value_counts()
+        print(f"     层级分布: {layer_counts.to_dict()}")
+
+        return predictions
 
     def _calculate_metrics(self, test_data, predictions):
         """
@@ -556,20 +531,42 @@ class WalkForwardValidator:
         df['prediction'] = predictions['prediction']
         df['probability'] = predictions['probability']
 
+        # 保存 Code 列（用于错误分析）
+        if 'Code' not in df.columns and 'Code' in predictions.columns:
+            df['Code'] = predictions['Code'].values
+
         # 确保索引对齐（删除预测中不存在于 test_data 的索引）
         df = df[df.index.isin(predictions.index)]
 
         if df.empty:
             raise ValueError("合并后的数据为空")
 
-        # 计算实际收益率
-        # 注意：模型训练时 Label 基于 Future_Return（20天累积收益）
-        # 但验证时使用 pct_change().shift(-horizon) 是合理的：
-        # 1. 模型预测的是"未来上涨/下跌的方向"，不是具体收益率
-        # 2. pct_change() 提供的是标准化后的收益方向和幅度
-        # 3. 累积收益会受到除权除息、停牌等因素影响，可能导致异常值
-        # 4. pct_change() 的单日收益更稳定，数值范围合理（±10%以内）
-        df['actual_return'] = df['Close'].pct_change().shift(-self.horizon)
+        # ========== 计算实际收益率（与训练时一致）==========
+        # 优先使用 Future_Return（在过滤前计算，包含正确的未来收益率）
+        # 如果 Future_Return 不存在，则使用 Close.shift(-horizon) 计算
+        if 'Future_Return' in df.columns and df['Future_Return'].notna().sum() > 0:
+            df['actual_return'] = df['Future_Return']
+        else:
+            # 训练时使用累积收益率：Close[t+horizon] / Close[t] - 1
+            df['actual_return'] = df['Close'].shift(-self.horizon) / df['Close'] - 1
+
+        # ========== 计算 IC 和 Rank IC ==========
+        # IC: 预测概率与实际收益率的相关系数（不是与二元标签）
+        # 这是业界标准定义：IC = Corr(Prediction, Actual_Return)
+        if 'actual_return' in df.columns:
+            valid_mask = df['actual_return'].notna() & df['probability'].notna()
+            if valid_mask.sum() > 1:
+                ic = df.loc[valid_mask, 'probability'].corr(df.loc[valid_mask, 'actual_return'])
+                rank_ic = df.loc[valid_mask, 'probability'].rank().corr(df.loc[valid_mask, 'actual_return'].rank())
+            else:
+                ic = 0.0
+                rank_ic = 0.0
+        else:
+            ic = 0.0
+            rank_ic = 0.0
+
+        # 预测分布统计
+        prediction_std = df['probability'].std()
 
         # 计算预测收益
         df['predicted_return'] = df['actual_return'] * df['prediction']
@@ -587,8 +584,15 @@ class WalkForwardValidator:
             ranging_filter = (df['Market_Regime'] != 'ranging') | (df['probability'] >= 0.75)
             df['risk_filter'] = df['risk_filter'] & ranging_filter
 
-        # 计算交易信号（应用风险过滤）
-        df['signal'] = ((df['prediction'] >= self.confidence_threshold) & df['risk_filter']).astype(int)
+        # 计算交易信号
+        # 优先使用市场情绪过滤后的信号，否则使用风险过滤
+        if 'filtered_signal' in predictions.columns:
+            # 使用市场情绪过滤后的信号
+            df['signal'] = predictions['filtered_signal'].values
+            print(f"  📊 使用市场情绪过滤信号")
+        else:
+            # 使用风险过滤（原有逻辑）
+            df['signal'] = ((df['prediction'] >= self.confidence_threshold) & df['risk_filter']).astype(int)
 
         # 计算收益率（扣除交易成本）
         df['strategy_return'] = df['signal'] * df['actual_return']
@@ -646,28 +650,29 @@ class WalkForwardValidator:
             batch_returns = np.array([])
             batch_returns_net = np.array([])
 
-        # ========== 年化收益和夏普比率计算（修正版） ==========
-        # 问题：之前用 avg_return * (252/horizon) 年化，假设一年可做12.6次交易
-        # 实际：固定持有期策略的多笔交易是同时持有的，不能这样年化
-        # 正确方法：基于批次收益的时间序列，月度收益 * 12 年化
+        # ========== 年化收益和夏普比率计算（修正版 v3） ==========
+        # 修正说明：
+        # - 批次收益是20天持有期的收益，不是日收益
+        # - 年化因子应考虑持有期：一年约252个交易日，20天持有期可做 252/20 ≈ 12.6 次交易
+        # - 年化收益 = 批次收益均值 * (252/horizon)
+        # - 年化波动率 = 批次收益标准差 * sqrt(252/horizon)
 
-        # 月度组合收益
-        monthly_return = avg_return
+        # 持有期调整因子
+        holding_period_factor = 252 / self.horizon  # 20天持有期 = 12.6
 
         # 年化收益
-        annualized_return = monthly_return * 12
+        annualized_return = avg_return * holding_period_factor
 
         # 标准差：基于批次收益的波动
         if len(batch_returns) > 1:
             batch_std = np.std(batch_returns, ddof=1)
-            monthly_std = batch_std
         elif return_std > 0:
-            monthly_std = return_std
+            batch_std = return_std
         else:
-            monthly_std = 0.0
+            batch_std = 0.0
 
-        # 年化标准差
-        annualized_std = monthly_std * np.sqrt(12) if monthly_std > 0 else 0.0
+        # 年化标准差（考虑持有期）
+        annualized_std = batch_std * np.sqrt(holding_period_factor) if batch_std > 0 else 0.0
 
         # ========== 最大回撤计算（批次回撤） ==========
         if len(batch_returns) > 1:
@@ -706,14 +711,14 @@ class WalkForwardValidator:
             sharpe_ratio = 0.0
 
         # 索提诺比率（只考虑下行风险，仅计算有交易的样本）
-        # 修正：使用与夏普比率一致的年化因子 sqrt(12)
+        # 修正：使用持有期调整的年化因子 sqrt(252/horizon)
         if len(trades) > 0:
             downside_returns = trades['strategy_return'][trades['strategy_return'] < 0]
             if len(downside_returns) > 0:
                 downside_std = downside_returns.std()
                 if downside_std > 0:
-                    # 月度下行标准差 * sqrt(12) 年化
-                    annualized_downside_std = downside_std * np.sqrt(12)
+                    # 持有期调整的年化下行标准差
+                    annualized_downside_std = downside_std * np.sqrt(holding_period_factor)
                     sortino_ratio = annualized_return / annualized_downside_std
                 else:
                     sortino_ratio = 0.0
@@ -726,133 +731,24 @@ class WalkForwardValidator:
         # 基准收益：所有样本的平均收益（代表买入持有）
         benchmark_return = df['actual_return'].mean()
         # 策略收益与基准的差异（只比较有交易的样本）
-        # 修正：使用与夏普比率一致的年化因子 sqrt(12)
+        # 修正：使用持有期调整的年化因子
         if len(trades) > 0:
             excess_returns = trades['strategy_return'] - trades['actual_return']
             tracking_error = excess_returns.std()
             if tracking_error > 0:
-                # 月度跟踪误差 * sqrt(12) 年化
-                annualized_tracking_error = tracking_error * np.sqrt(12)
-                information_ratio = (excess_returns.mean() * 12) / annualized_tracking_error
+                # 持有期调整的年化跟踪误差
+                annualized_tracking_error = tracking_error * np.sqrt(holding_period_factor)
+                information_ratio = (excess_returns.mean() * holding_period_factor) / annualized_tracking_error
             else:
                 information_ratio = 0.0
         else:
             information_ratio = 0.0
 
-        # ========== IC 指标计算（选股能力评估）==========
-        # IC (Information Coefficient): 预测概率与实际收益的 Pearson 相关系数
-        # Rank IC: 预测排名与实际收益排名的 Spearman 相关系数
-        from scipy.stats import pearsonr, spearmanr
+        # ========== 置信度与收益关系分析 ==========
+        confidence_bins = self._calculate_confidence_return_breakdown(df)
 
-        # 只计算有有效预测和收益的样本
-        valid_mask = ~df['actual_return'].isna() & ~df['probability'].isna()
-        valid_count = valid_mask.sum()
-
-        if valid_count > 10:  # 至少10个样本才计算相关性
-            try:
-                ic, ic_pvalue = pearsonr(
-                    df.loc[valid_mask, 'probability'],
-                    df.loc[valid_mask, 'actual_return']
-                )
-                rank_ic, rank_ic_pvalue = spearmanr(
-                    df.loc[valid_mask, 'probability'],
-                    df.loc[valid_mask, 'actual_return']
-                )
-                # 处理 NaN
-                if np.isnan(ic):
-                    ic = 0.0
-                if np.isnan(rank_ic):
-                    rank_ic = 0.0
-            except Exception:
-                ic = 0.0
-                rank_ic = 0.0
-        else:
-            ic = 0.0
-            rank_ic = 0.0
-
-        # 预测分散度：预测概率的标准差
-        # 用于检测"全涨全跌"问题（分散度过低表示预测缺乏区分度）
-        prediction_std = df['probability'].std() if 'probability' in df.columns else 0.0
-
-        # ========== 头部精度分析（Top Percentile Accuracy）==========
-        # 分析预测概率最高的股票其实际收益分布
-        top_metrics = {}
-        if valid_count > 20:  # 至少20个样本才计算头部精度
-            valid_df = df[valid_mask].copy()
-
-            # Top 1%, 5%, 10%, 20% 分析
-            for pct in [1, 5, 10, 20]:
-                threshold = valid_df['probability'].quantile(1 - pct/100)
-                top_mask = valid_df['probability'] >= threshold
-                top_df = valid_df[top_mask]
-
-                if len(top_df) > 0:
-                    top_return = top_df['actual_return'].mean()
-                    top_std = top_df['actual_return'].std()
-                    top_win_rate = (top_df['actual_return'] > 0).mean()
-
-                    # 与整体平均收益比较
-                    overall_return = valid_df['actual_return'].mean()
-                    excess_return = top_return - overall_return
-
-                    top_metrics[f'top{pct}_return'] = top_return
-                    top_metrics[f'top{pct}_std'] = top_std
-                    top_metrics[f'top{pct}_win_rate'] = top_win_rate
-                    top_metrics[f'top{pct}_excess'] = excess_return
-                    top_metrics[f'top{pct}_count'] = len(top_df)
-
-            # ========== P9 新增：保存 Top 25% 推荐股票详情 ==========
-            top_25_threshold = valid_df['probability'].quantile(0.75)
-            top_25_df = valid_df[valid_df['probability'] >= top_25_threshold].copy()
-
-            if len(top_25_df) > 0:
-                top_25_stocks = []
-                for idx, row in top_25_df.iterrows():
-                    code = row.get('Code', '') if 'Code' in row.index else ''
-                    actual_rank = (valid_df['actual_return'] > row['actual_return']).sum() + 1
-                    hit = 1 if row['actual_return'] > valid_df['actual_return'].median() else 0
-
-                    top_25_stocks.append({
-                        'code': code,
-                        'date': str(idx) if hasattr(idx, '__str__') else '',
-                        'predict_prob': float(row['probability']),
-                        'rank': int((valid_df['probability'] > row['probability']).sum() + 1),
-                        'actual_return': float(row['actual_return']),
-                        'actual_rank': actual_rank,
-                        'hit': hit
-                    })
-                top_metrics['top25_stocks'] = top_25_stocks
-
-            # ========== P9 新增：保存错误案例分析 ==========
-            # False Positive: 预测高概率但实际收益为负
-            fp_df = valid_df[(valid_df['probability'] >= 0.7) & (valid_df['actual_return'] < 0)]
-            # False Negative: 预测低概率但实际收益为正
-            fn_df = valid_df[(valid_df['probability'] <= 0.3) & (valid_df['actual_return'] > 0)]
-
-            error_cases = []
-            for idx, row in fp_df.head(10).iterrows():  # 只保存前10个
-                code = row.get('Code', '') if 'Code' in row.index else ''
-                error_cases.append({
-                    'code': code,
-                    'date': str(idx) if hasattr(idx, '__str__') else '',
-                    'predict_prob': float(row['probability']),
-                    'actual_return': float(row['actual_return']),
-                    'error_type': 'False Positive',
-                    'reason': '高概率预测但实际下跌'
-                })
-
-            for idx, row in fn_df.head(10).iterrows():  # 只保存前10个
-                code = row.get('Code', '') if 'Code' in row.index else ''
-                error_cases.append({
-                    'code': code,
-                    'date': str(idx) if hasattr(idx, '__str__') else '',
-                    'predict_prob': float(row['probability']),
-                    'actual_return': float(row['actual_return']),
-                    'error_type': 'False Negative',
-                    'reason': '低概率预测但实际上涨'
-                })
-
-            top_metrics['error_cases'] = error_cases
+        # ========== 错误分析 ==========
+        error_analysis = self._analyze_errors(df)
 
         return {
             'num_samples': num_samples,
@@ -872,13 +768,194 @@ class WalkForwardValidator:
             'information_ratio': information_ratio,
             'benchmark_return': benchmark_return,
             'transaction_cost': TOTAL_COST,  # 记录使用的交易成本
-            # 新增 IC 指标
-            'ic': ic,
-            'rank_ic': rank_ic,
+            # 新增指标
+            'ic': ic if not np.isnan(ic) else 0.0,
+            'rank_ic': rank_ic if not np.isnan(rank_ic) else 0.0,
             'prediction_std': prediction_std,
-            # 头部精度指标
-            'top_metrics': top_metrics
+            'confidence_breakdown': confidence_bins,
+            'error_analysis': error_analysis,
+            # 百分位预测效果分析
+            'percentile_performance': self._calculate_percentile_performance(df)
         }
+
+    def _calculate_percentile_performance(self, df):
+        """
+        计算不同百分位预测股票的实际效果
+
+        方法：每个交易日按预测概率排名，分成 Top 1%/5%/10%/20% 四组，
+        计算每组的平均实际收益。
+
+        Args:
+            df: 包含 probability, actual_return, Code 的 DataFrame
+
+        Returns:
+            list: 各百分位的收益统计
+        """
+        if 'Code' not in df.columns or 'actual_return' not in df.columns:
+            return []
+
+        # 导入股票名称映射
+        try:
+            from config import WATCHLIST as STOCK_NAMES
+        except ImportError:
+            STOCK_NAMES = {}
+
+        # 按日期分组，计算截面百分位
+        df = df.copy()
+        # 提取日期（处理时区问题）
+        if hasattr(df.index, 'date'):
+            df['date'] = df.index.date
+        elif hasattr(df.index[0], 'strftime'):
+            df['date'] = df.index.strftime('%Y-%m-%d')
+        else:
+            df['date'] = df.index
+
+        percentiles = [1, 5, 10, 20]
+        results = {f'Top_{p}pct': {'count': 0, 'total_return': 0.0, 'returns': [], 'stocks': []}
+                   for p in percentiles}
+
+        for date, group in df.groupby('date'):
+            if len(group) < 5:  # 样本太少跳过
+                continue
+
+            # 过滤掉 actual_return 为 NaN 的样本
+            group = group.dropna(subset=['actual_return', 'probability'])
+            if len(group) < 5:
+                continue
+
+            # 按预测概率降序排列
+            group = group.sort_values('probability', ascending=False)
+
+            for p in percentiles:
+                # 计算该百分位的股票数量
+                n_stocks = max(1, int(len(group) * p / 100))
+                top_stocks = group.head(n_stocks)
+
+                # 计算平均收益
+                avg_return = top_stocks['actual_return'].mean()
+                if not np.isnan(avg_return):
+                    results[f'Top_{p}pct']['count'] += n_stocks
+                    results[f'Top_{p}pct']['total_return'] += avg_return * n_stocks
+                    results[f'Top_{p}pct']['returns'].append(avg_return)
+
+                    # 记录股票详情（只记录 Top 1% 和 Top 5%）
+                    if p <= 5:
+                        for _, row in top_stocks.iterrows():
+                            code = row.get('Code', 'Unknown')
+                            stock_name = STOCK_NAMES.get(code, code) if isinstance(STOCK_NAMES, dict) else code
+                            results[f'Top_{p}pct']['stocks'].append({
+                                'date': str(date),
+                                'code': code,
+                                'name': stock_name,
+                                'probability': round(float(row.get('probability', 0)), 4),
+                                'actual_return': round(float(row.get('actual_return', 0)), 4)
+                            })
+
+        # 计算最终统计
+        final_results = []
+        for p in percentiles:
+            key = f'Top_{p}pct'
+            if results[key]['count'] > 0:
+                result_item = {
+                    'percentile': f'Top {p}%',
+                    'total_stocks': results[key]['count'],
+                    'avg_return': float(results[key]['total_return'] / results[key]['count']),
+                    'return_std': float(np.std(results[key]['returns'])) if results[key]['returns'] else 0.0,
+                    'num_periods': len(results[key]['returns'])
+                }
+                # 只在 Top 1% 和 Top 5% 中包含股票详情
+                if p <= 5 and results[key]['stocks']:
+                    result_item['top_stocks'] = results[key]['stocks'][:50]  # 最多记录50条
+                final_results.append(result_item)
+
+        return final_results
+
+    def _calculate_confidence_return_breakdown(self, df):
+        """计算置信度与收益关系"""
+        bins = [
+            (0.8, 1.0, '0.8-1.0'),
+            (0.7, 0.8, '0.7-0.8'),
+            (0.6, 0.7, '0.6-0.7'),
+            (0.5, 0.6, '0.5-0.6'),
+            (0.0, 0.5, '0.0-0.5')
+        ]
+
+        confidence_breakdown = []
+        for low, high, label in bins:
+            mask = (df['probability'] >= low) & (df['probability'] < high)
+            subset = df[mask]
+            if len(subset) > 0:
+                avg_return = subset['actual_return'].mean()
+                hit_rate = (subset['Label'] == 1).sum() / len(subset) if 'Label' in subset.columns else 0
+                confidence_breakdown.append({
+                    'range': label,
+                    'count': len(subset),
+                    'avg_return': float(avg_return) if not np.isnan(avg_return) else 0,
+                    'hit_rate': float(hit_rate)
+                })
+            else:
+                confidence_breakdown.append({
+                    'range': label,
+                    'count': 0,
+                    'avg_return': 0,
+                    'hit_rate': 0
+                })
+
+        return confidence_breakdown
+
+    def _analyze_errors(self, df):
+        """分析所有预测（包括正确和错误预测）"""
+        predictions = []
+
+        # 需要有 Code 列才能进行分析
+        if 'Code' not in df.columns:
+            return predictions
+
+        for idx, row in df.iterrows():
+            prob = row['probability']
+            actual_return = row.get('actual_return', 0)
+            code = row.get('Code', 'Unknown')
+
+            # 处理 NaN 值
+            if pd.isna(actual_return):
+                continue
+
+            # 判断预测方向和实际方向
+            predict_up = prob >= 0.5
+            actual_up = actual_return > 0
+
+            # 判断预测是否正确
+            is_correct = (predict_up and actual_up) or (not predict_up and not actual_up)
+
+            # 确定预测类型
+            if is_correct:
+                if predict_up:
+                    pred_type = 'True Positive'  # 预测涨，实际涨
+                    reason = '正确预测上涨'
+                else:
+                    pred_type = 'True Negative'  # 预测跌，实际跌
+                    reason = '正确预测下跌'
+            else:
+                if predict_up:
+                    pred_type = 'False Positive'  # 预测涨，实际跌
+                    reason = '预测涨但实际下跌'
+                else:
+                    pred_type = 'False Negative'  # 预测跌，实际涨
+                    reason = '预测跌但实际上涨'
+
+            predictions.append({
+                'Date': idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx),
+                'Stock_Code': code,
+                'Predict_Prob': round(prob, 4),
+                'Predict_Direction': 'UP' if predict_up else 'DOWN',
+                'Actual_Return': round(actual_return, 4),
+                'Actual_Direction': 'UP' if actual_up else 'DOWN',
+                'Is_Correct': is_correct,
+                'Prediction_Type': pred_type,
+                'Note': reason
+            })
+
+        return predictions
 
     def _calculate_overall_metrics(self, fold_results):
         """
@@ -902,35 +979,6 @@ class WalkForwardValidator:
         avg_sortino_ratio = np.mean([r['sortino_ratio'] for r in fold_results])
         avg_information_ratio = np.mean([r['information_ratio'] for r in fold_results])
 
-        # IC 指标平均（新增）
-        avg_ic = np.mean([r.get('ic', 0) for r in fold_results])
-        avg_rank_ic = np.mean([r.get('rank_ic', 0) for r in fold_results])
-        avg_prediction_std = np.mean([r.get('prediction_std', 0) for r in fold_results])
-        ic_std = np.std([r.get('ic', 0) for r in fold_results])
-        rank_ic_std = np.std([r.get('rank_ic', 0) for r in fold_results])
-
-        # 头部精度指标汇总
-        top_percentile_metrics = {}
-        for pct in [1, 5, 10, 20]:
-            returns = []
-            win_rates = []
-            excesses = []
-            counts = []
-            for r in fold_results:
-                tm = r.get('top_metrics', {})
-                if f'top{pct}_return' in tm:
-                    returns.append(tm[f'top{pct}_return'])
-                    win_rates.append(tm[f'top{pct}_win_rate'])
-                    excesses.append(tm[f'top{pct}_excess'])
-                    counts.append(tm[f'top{pct}_count'])
-
-            if returns:
-                top_percentile_metrics[f'top{pct}_avg_return'] = np.mean(returns)
-                top_percentile_metrics[f'top{pct}_avg_win_rate'] = np.mean(win_rates)
-                top_percentile_metrics[f'top{pct}_avg_excess'] = np.mean(excesses)
-                top_percentile_metrics[f'top{pct}_total_count'] = sum(counts)
-                top_percentile_metrics[f'top{pct}_return_std'] = np.std(returns)
-
         # 稳定性分析
         return_std = np.std([r['avg_return'] for r in fold_results])
         return_range = np.max([r['avg_return'] for r in fold_results]) - np.min([r['avg_return'] for r in fold_results])
@@ -946,20 +994,38 @@ class WalkForwardValidator:
             stability_rating = "低（需改进）"
 
         # 综合评估评分（0-100分）
-        # 权重：夏普比率30%，最大回撤25%，索提诺比率25%，稳定性20%
+        # 权重：夏普比率25%，IC指标25%，最大回撤25%，稳定性25%
+        # 修正说明：年化因子修正后夏普比率约0.97，评分标准相应调整
         score = 0
 
-        # 1. 夏普比率评分（30分）：业界标准 >1.0
-        if avg_sharpe_ratio >= 1.0:
-            score += 30
-        elif avg_sharpe_ratio >= 0.8:
+        # 1. 夏普比率评分（25分）：修正后业界标准 >0.5 为良好，>1.0 为优秀
+        if avg_sharpe_ratio >= 1.5:
             score += 25
+        elif avg_sharpe_ratio >= 1.0:
+            score += 22
         elif avg_sharpe_ratio >= 0.5:
-            score += 20
+            score += 18
+        elif avg_sharpe_ratio >= 0.3:
+            score += 15
         elif avg_sharpe_ratio >= 0:
             score += 10
 
-        # 2. 最大回撤评分（25分）：业界标准 <-20%
+        # 2. IC指标评分（25分）：IC >0.05 表示有效预测能力
+        avg_ic = np.mean([r.get('ic', 0) for r in fold_results])
+        avg_rank_ic = np.mean([r.get('rank_ic', 0) for r in fold_results])
+        if avg_ic >= 0.20:
+            score += 25
+        elif avg_ic >= 0.15:
+            score += 22
+        elif avg_ic >= 0.10:
+            score += 18
+        elif avg_ic >= 0.05:
+            score += 15
+        elif avg_ic >= 0:
+            score += 10
+
+        # 3. 最大回撤评分（25分）：业界标准 <-20%
+        # 注意：当前为信号级回测，实际回撤可能更大
         if avg_max_drawdown > -0.05:  # -5%以内，优秀
             score += 25
         elif avg_max_drawdown > -0.10:  # -10%以内，良好
@@ -968,40 +1034,36 @@ class WalkForwardValidator:
             score += 15
         elif avg_max_drawdown > -0.30:  # -30%以内，较差
             score += 10
-
-        # 3. 索提诺比率评分（25分）：业界标准 >1.0
-        if avg_sortino_ratio >= 2.0:
-            score += 25
-        elif avg_sortino_ratio >= 1.0:
-            score += 20
-        elif avg_sortino_ratio >= 0.5:
-            score += 15
-        elif avg_sortino_ratio >= 0:
-            score += 10
-
-        # 4. 稳定性评分（20分）
-        if return_std < 0.02:
-            score += 20
-        elif return_std < 0.05:
-            score += 15
-        elif return_std < 0.10:
-            score += 10
         else:
             score += 5
 
+        # 4. 稳定性评分（25分）：基于收益标准差和Fold波动
+        # Fold波动大（准确率标准差>0.08）扣分
+        if return_std < 0.02 and sharpe_std < 2.0:
+            score += 25
+        elif return_std < 0.05 and sharpe_std < 3.0:
+            score += 20
+        elif return_std < 0.10:
+            score += 15
+        else:
+            score += 10
+
         # 综合评级
-        if score >= 80:
+        if score >= 85:
             overall_rating = "优秀"
             recommendation = "强烈推荐实盘"
-        elif score >= 60:
+        elif score >= 70:
             overall_rating = "良好"
             recommendation = "推荐实盘"
-        elif score >= 40:
+        elif score >= 55:
             overall_rating = "一般"
             recommendation = "谨慎使用"
         else:
             overall_rating = "不佳"
             recommendation = "需要改进"
+
+        # Rank IC 在评分中已计算 avg_ic
+        avg_rank_ic = np.mean([r.get('rank_ic', 0) for r in fold_results])
 
         return {
             'num_folds': len(fold_results),
@@ -1020,19 +1082,14 @@ class WalkForwardValidator:
             'overall_score': score,
             'overall_rating': overall_rating,
             'recommendation': recommendation,
-            # 新增 IC 指标
+            # 新增指标
             'avg_ic': avg_ic,
-            'avg_rank_ic': avg_rank_ic,
-            'avg_prediction_std': avg_prediction_std,
-            'ic_std': ic_std,
-            'rank_ic_std': rank_ic_std,
-            # 头部精度指标
-            'top_percentile_metrics': top_percentile_metrics
+            'avg_rank_ic': avg_rank_ic
         }
 
     def save_report(self, report, output_dir='output'):
         """
-        保存验证报告（CSV、JSON、Markdown格式）
+        保存验证报告（CSV、JSON、Markdown格式 + 详细分析文件）
 
         Args:
             report: 验证报告
@@ -1046,19 +1103,202 @@ class WalkForwardValidator:
         model_type = report['validation_config']['model_type']
         horizon = report['validation_config']['horizon']
 
-        # 1. 保存JSON格式
+        # 创建详细结果目录
+        detail_dir = os.path.join(output_dir, f'{timestamp}_{model_type}_{horizon}d')
+        os.makedirs(detail_dir, exist_ok=True)
+
+        # 1. 保存 validation_summary.json
+        summary = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'model_type': model_type,
+            'horizon': horizon,
+            'num_folds': report['validation_config']['num_folds'],
+            'num_stocks': len(report['validation_config']['stock_list']),
+            'overall_metrics': {
+                'score': report['overall_metrics'].get('overall_score', 0),
+                'rating': report['overall_metrics'].get('overall_rating', 'N/A'),
+                'recommendation': report['overall_metrics'].get('recommendation', 'N/A'),
+                'avg_sharpe': report['overall_metrics'].get('avg_sharpe_ratio', 0),
+                'avg_ic': report['overall_metrics'].get('avg_ic', 0),
+                'avg_rank_ic': report['overall_metrics'].get('avg_rank_ic', 0)
+            },
+            'saved_files': ['prediction_distribution', 'fold_metrics_detail', 'prediction_analysis', 'confidence_return_breakdown', 'percentile_performance']
+        }
+        summary_file = os.path.join(detail_dir, 'validation_summary.json')
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        logger.info(f"汇总报告已保存: {summary_file}")
+
+        # 2. 保存 fold_metrics_detail.json
+        fold_metrics = {
+            'model_type': model_type,
+            'horizon': horizon,
+            'folds': []
+        }
+        for fold in report['fold_results']:
+            fold_data = {
+                'fold': fold.get('fold', 0) + 1,
+                'train_period': f"{fold.get('train_start_date', '')} to {fold.get('train_end_date', '')}",
+                'test_period': f"{fold.get('test_start_date', '')} to {fold.get('test_end_date', '')}",
+                'metrics': {
+                    'ic': fold.get('ic', 0),
+                    'rank_ic': fold.get('rank_ic', 0),
+                    'accuracy': fold.get('accuracy', 0),
+                    'sharpe': fold.get('sharpe_ratio', 0),
+                    'max_drawdown': fold.get('max_drawdown', 0),
+                    'sortino': fold.get('sortino_ratio', 0),
+                    'win_rate': fold.get('win_rate', 0),
+                    'avg_return': fold.get('avg_return', 0)
+                },
+                'sample_counts': {
+                    'total': fold.get('num_samples', 0),
+                    'train': fold.get('num_train_samples', 0),
+                    'test': fold.get('num_test_samples', 0)
+                },
+                'top_features': fold.get('top_features', [])
+            }
+            fold_metrics['folds'].append(fold_data)
+
+        metrics_file = os.path.join(detail_dir, 'fold_metrics_detail.json')
+        with open(metrics_file, 'w', encoding='utf-8') as f:
+            json.dump(fold_metrics, f, indent=2, ensure_ascii=False)
+        logger.info(f"Fold详细指标已保存: {metrics_file}")
+
+        # 3. 保存 prediction_distribution.json
+        pred_dist = {
+            'folds': [],
+            'overall': {
+                'avg_ic': report['overall_metrics'].get('avg_ic', 0),
+                'avg_rank_ic': report['overall_metrics'].get('avg_rank_ic', 0),
+                'avg_prediction_std': np.mean([f.get('prediction_std', 0) for f in report['fold_results']])
+            }
+        }
+        for fold in report['fold_results']:
+            pred_dist['folds'].append({
+                'fold': fold.get('fold', 0) + 1,
+                'test_period': f"{fold.get('test_start_date', '')} to {fold.get('test_end_date', '')}",
+                'prediction_stats': {
+                    'std': fold.get('prediction_std', 0),
+                    'ic': fold.get('ic', 0),
+                    'rank_ic': fold.get('rank_ic', 0)
+                }
+            })
+
+        pred_file = os.path.join(detail_dir, 'prediction_distribution.json')
+        with open(pred_file, 'w', encoding='utf-8') as f:
+            json.dump(pred_dist, f, indent=2, ensure_ascii=False)
+        logger.info(f"预测分布已保存: {pred_file}")
+
+        # 4. 保存 prediction_analysis.csv（所有预测，包括正确和错误）
+        all_predictions = []
+        for fold in report['fold_results']:
+            fold_num = fold.get('fold', 0) + 1
+            for pred in fold.get('error_analysis', []):
+                pred['Fold'] = fold_num
+                all_predictions.append(pred)
+
+        if all_predictions:
+            pred_df = pd.DataFrame(all_predictions)
+            # 调整列顺序
+            cols = ['Fold', 'Date', 'Stock_Code', 'Predict_Prob', 'Predict_Direction',
+                    'Actual_Return', 'Actual_Direction', 'Is_Correct', 'Prediction_Type', 'Note']
+            pred_df = pred_df[[c for c in cols if c in pred_df.columns]]
+            pred_file = os.path.join(detail_dir, 'prediction_analysis.csv')
+            pred_df.to_csv(pred_file, index=False)
+            logger.info(f"预测分析已保存: {pred_file}")
+
+        # 5. 保存 confidence_return_breakdown.json
+        # 汇总所有 fold 的置信度分析
+        confidence_summary = {'confidence_bins': []}
+        bins_labels = ['0.8-1.0', '0.7-0.8', '0.6-0.7', '0.5-0.6', '0.0-0.5']
+
+        for label in bins_labels:
+            total_count = 0
+            total_return = 0
+            total_hit_rate = 0
+            fold_count = 0
+
+            for fold in report['fold_results']:
+                for breakdown in fold.get('confidence_breakdown', []):
+                    if breakdown['range'] == label:
+                        total_count += breakdown['count']
+                        total_return += breakdown['avg_return'] * breakdown['count']
+                        total_hit_rate += breakdown['hit_rate'] * breakdown['count']
+                        fold_count += 1
+                        break
+
+            if total_count > 0:
+                confidence_summary['confidence_bins'].append({
+                    'range': label,
+                    'count': total_count,
+                    'avg_return': total_return / total_count,
+                    'hit_rate': total_hit_rate / total_count
+                })
+            else:
+                confidence_summary['confidence_bins'].append({
+                    'range': label,
+                    'count': 0,
+                    'avg_return': 0,
+                    'hit_rate': 0
+                })
+
+        conf_file = os.path.join(detail_dir, 'confidence_return_breakdown.json')
+        with open(conf_file, 'w', encoding='utf-8') as f:
+            json.dump(confidence_summary, f, indent=2, ensure_ascii=False)
+        logger.info(f"置信度分析已保存: {conf_file}")
+
+        # 6. 保存 percentile_performance.json
+        all_percentile_results = []
+        for fold in report['fold_results']:
+            fold_num = fold.get('fold', 0) + 1
+            for pct_result in fold.get('percentile_performance', []):
+                pct_result_copy = pct_result.copy()
+                pct_result_copy['fold'] = fold_num
+                all_percentile_results.append(pct_result_copy)
+
+        if all_percentile_results:
+            # 汇总各百分位的平均收益
+            percentile_summary = {}
+            for result in all_percentile_results:
+                pct = result['percentile']
+                if pct not in percentile_summary:
+                    percentile_summary[pct] = {'total_return': 0.0, 'count': 0, 'returns': []}
+                percentile_summary[pct]['total_return'] += result['avg_return'] * result['total_stocks']
+                percentile_summary[pct]['count'] += result['total_stocks']
+                percentile_summary[pct]['returns'].append(result['avg_return'])
+
+            final_summary = []
+            for pct in ['Top 1%', 'Top 5%', 'Top 10%', 'Top 20%']:
+                if pct in percentile_summary:
+                    data = percentile_summary[pct]
+                    final_summary.append({
+                        'percentile': pct,
+                        'avg_return': float(data['total_return'] / data['count']) if data['count'] > 0 else 0.0,
+                        'return_std': float(np.std(data['returns'])) if data['returns'] else 0.0,
+                        'total_stocks': data['count']
+                    })
+
+            percentile_file = os.path.join(detail_dir, 'percentile_performance.json')
+            with open(percentile_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'summary': final_summary,
+                    'by_fold': all_percentile_results
+                }, f, indent=2, ensure_ascii=False)
+            logger.info(f"百分位效果分析已保存: {percentile_file}")
+
+        # 7. 保存完整JSON格式（原有逻辑）
         json_file = os.path.join(output_dir, f'walk_forward_{model_type}_{horizon}d_{timestamp}.json')
         with open(json_file, 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, ensure_ascii=False, default=str)
         logger.info(f"JSON报告已保存: {json_file}")
 
-        # 2. 保存CSV格式
+        # 7. 保存CSV格式（原有逻辑）
         csv_file = os.path.join(output_dir, f'walk_forward_{model_type}_{horizon}d_{timestamp}.csv')
         fold_df = pd.DataFrame(report['fold_results'])
         fold_df.to_csv(csv_file, index=False)
         logger.info(f"CSV报告已保存: {csv_file}")
 
-        # 3. 保存Markdown格式
+        # 8. 保存Markdown格式（原有逻辑）
         md_file = os.path.join(output_dir, f'walk_forward_{model_type}_{horizon}d_{timestamp}.md')
         self._generate_markdown_report(report, md_file)
         logger.info(f"Markdown报告已保存: {md_file}")
@@ -1066,474 +1306,8 @@ class WalkForwardValidator:
         return {
             'json_file': json_file,
             'csv_file': csv_file,
-            'md_file': md_file
-        }
-
-    def save_detailed_results(self, report, model, output_dir='data/validation_results'):
-        """
-        保存详细的验证结果（P9 阶段新增）
-
-        保存 10 个分析文件：
-        1. feature_importance_top50.json - Top 50 特征重要性
-        2. recommended_stocks_returns.csv - 前 25% 推荐股票及真实收益率
-        3. prediction_distribution.json - 预测概率分布统计
-        4. fold_metrics_detail.json - 各 Fold 详细指标
-        5. top_stocks_features.csv - 推荐股票的特征值
-        6. error_analysis.csv - 错误案例分析
-        7. sector_distribution.json - 板块分布
-        8. feature_correlation_top20.csv - Top 20 特征相关性
-        9. confidence_return_breakdown.json - 置信度分层收益
-        10. validation_summary.json - 验证摘要
-
-        Args:
-            report: 验证报告
-            model: 训练好的模型（用于获取特征重要性）
-            output_dir: 输出目录
-
-        Returns:
-            dict: 保存的文件路径
-        """
-        import os
-        import json
-        from datetime import datetime
-        from config import STOCK_SECTOR_MAPPING
-
-        # 创建输出目录
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_type = report['validation_config']['model_type']
-        horizon = report['validation_config']['horizon']
-        result_dir = os.path.join(output_dir, f'{timestamp}_{model_type}_{horizon}d')
-        os.makedirs(result_dir, exist_ok=True)
-
-        saved_files = {}
-
-        # ========== 1. 特征重要性 Top 50 ==========
-        try:
-            feature_importance = self._get_feature_importance(model)
-            if feature_importance:
-                top50_data = {
-                    'model_type': model_type,
-                    'horizon': horizon,
-                    'timestamp': timestamp,
-                    'top_50_features': feature_importance[:50],
-                    'feature_type_summary': self._summarize_feature_types(feature_importance[:50])
-                }
-                file_path = os.path.join(result_dir, 'feature_importance_top50.json')
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(top50_data, f, indent=2, ensure_ascii=False)
-                saved_files['feature_importance_top50'] = file_path
-                logger.info(f"特征重要性已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存特征重要性失败: {e}")
-
-        # ========== 2. 推荐股票收益率 ==========
-        try:
-            recommended_stocks = self._extract_recommended_stocks(report)
-            if recommended_stocks:
-                file_path = os.path.join(result_dir, 'recommended_stocks_returns.csv')
-                recommended_stocks.to_csv(file_path, index=False)
-                saved_files['recommended_stocks_returns'] = file_path
-                logger.info(f"推荐股票收益率已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存推荐股票收益率失败: {e}")
-
-        # ========== 3. 预测分布统计 ==========
-        try:
-            pred_dist = self._calculate_prediction_distribution(report)
-            if pred_dist:
-                file_path = os.path.join(result_dir, 'prediction_distribution.json')
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(pred_dist, f, indent=2, ensure_ascii=False)
-                saved_files['prediction_distribution'] = file_path
-                logger.info(f"预测分布统计已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存预测分布统计失败: {e}")
-
-        # ========== 4. Fold 详细指标 ==========
-        try:
-            fold_detail = self._extract_fold_metrics_detail(report)
-            if fold_detail:
-                file_path = os.path.join(result_dir, 'fold_metrics_detail.json')
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(fold_detail, f, indent=2, ensure_ascii=False, default=str)
-                saved_files['fold_metrics_detail'] = file_path
-                logger.info(f"Fold 详细指标已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存 Fold 详细指标失败: {e}")
-
-        # ========== 5. 推荐股票特征值 ==========
-        try:
-            top_features = self._extract_top_stocks_features(report, model)
-            if top_features is not None and not top_features.empty:
-                file_path = os.path.join(result_dir, 'top_stocks_features.csv')
-                top_features.to_csv(file_path, index=False)
-                saved_files['top_stocks_features'] = file_path
-                logger.info(f"推荐股票特征值已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存推荐股票特征值失败: {e}")
-
-        # ========== 6. 错误分析 ==========
-        try:
-            error_analysis = self._analyze_errors(report)
-            if error_analysis is not None and not error_analysis.empty:
-                file_path = os.path.join(result_dir, 'error_analysis.csv')
-                error_analysis.to_csv(file_path, index=False)
-                saved_files['error_analysis'] = file_path
-                logger.info(f"错误分析已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存错误分析失败: {e}")
-
-        # ========== 7. 板块分布 ==========
-        try:
-            sector_dist = self._analyze_sector_distribution(report)
-            if sector_dist:
-                file_path = os.path.join(result_dir, 'sector_distribution.json')
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(sector_dist, f, indent=2, ensure_ascii=False)
-                saved_files['sector_distribution'] = file_path
-                logger.info(f"板块分布已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存板块分布失败: {e}")
-
-        # ========== 8. 特征相关性 Top 20 ==========
-        try:
-            feature_corr = self._calculate_feature_correlation(model, report)
-            if feature_corr is not None and not feature_corr.empty:
-                file_path = os.path.join(result_dir, 'feature_correlation_top20.csv')
-                feature_corr.to_csv(file_path, index=False)
-                saved_files['feature_correlation_top20'] = file_path
-                logger.info(f"特征相关性已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存特征相关性失败: {e}")
-
-        # ========== 9. 置信度分层收益 ==========
-        try:
-            confidence_breakdown = self._analyze_confidence_return(report)
-            if confidence_breakdown:
-                file_path = os.path.join(result_dir, 'confidence_return_breakdown.json')
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(confidence_breakdown, f, indent=2, ensure_ascii=False)
-                saved_files['confidence_return_breakdown'] = file_path
-                logger.info(f"置信度分层收益已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存置信度分层收益失败: {e}")
-
-        # ========== 10. 验证摘要 ==========
-        try:
-            summary = self._generate_validation_summary(report, saved_files)
-            file_path = os.path.join(result_dir, 'validation_summary.json')
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
-            saved_files['validation_summary'] = file_path
-            logger.info(f"验证摘要已保存: {file_path}")
-        except Exception as e:
-            logger.warning(f"保存验证摘要失败: {e}")
-
-        print(f"\n📁 详细验证结果已保存至: {result_dir}")
-        print(f"   共保存 {len(saved_files)} 个文件")
-
-        return saved_files
-
-    def _get_feature_importance(self, model):
-        """获取特征重要性"""
-        if not hasattr(model, 'catboost_model') or model.catboost_model is None:
-            return []
-
-        try:
-            importances = model.catboost_model.get_feature_importance()
-            feature_names = model.feature_columns
-
-            # 排序并格式化
-            sorted_idx = np.argsort(importances)[::-1]
-            result = []
-            for i, idx in enumerate(sorted_idx[:50], 1):
-                feat_name = feature_names[idx] if idx < len(feature_names) else f'unknown_{idx}'
-                feat_type = self._classify_feature_type(feat_name)
-                result.append({
-                    'rank': i,
-                    'feature': feat_name,
-                    'importance': float(importances[idx]),
-                    'type': feat_type
-                })
-            return result
-        except Exception as e:
-            logger.warning(f"获取特征重要性失败: {e}")
-            return []
-
-    def _classify_feature_type(self, feature_name):
-        """分类特征类型"""
-        if '_CS_Pct' in feature_name or '_CS_ZScore' in feature_name:
-            return 'cross_sectional'
-        elif any(x in feature_name for x in ['HSI_', 'SP500_', 'NASDAQ_', 'US_10Y', 'VIX']):
-            return 'macro'
-        elif any(x in feature_name for x in ['PE', 'PB', 'ROE', 'Market_Cap', 'Dividend']):
-            return 'fundamental'
-        elif 'net_' in feature_name:
-            return 'network'
-        else:
-            return 'individual'
-
-    def _summarize_feature_types(self, top_features):
-        """汇总特征类型"""
-        type_counts = {}
-        for f in top_features:
-            t = f['type']
-            type_counts[t] = type_counts.get(t, 0) + 1
-        return type_counts
-
-    def _extract_recommended_stocks(self, report):
-        """提取前 25% 推荐股票及真实收益率"""
-        from config import WATCHLIST
-
-        records = []
-        for fold_result in report.get('fold_results', []):
-            fold = fold_result.get('fold', 0)
-            test_start = fold_result.get('test_start_date', '')
-            test_end = fold_result.get('test_end_date', '')
-
-            # 从 top_metrics 中提取
-            top_metrics = fold_result.get('top_metrics', {})
-            if not top_metrics:
-                continue
-
-            # 提取 Top 25% 数据
-            for pct in [25]:
-                key = f'top{pct}_stocks'
-                if key in top_metrics:
-                    for stock_info in top_metrics[key]:
-                        code = stock_info.get('code', '')
-                        records.append({
-                            'Fold': fold + 1,
-                            'Date': stock_info.get('date', test_start),
-                            'Stock_Code': code,
-                            'Stock_Name': WATCHLIST.get(code, code),
-                            'Predict_Prob': stock_info.get('predict_prob', 0),
-                            'Rank': stock_info.get('rank', 0),
-                            'Actual_Return': stock_info.get('actual_return', 0),
-                            'Actual_Rank': stock_info.get('actual_rank', 0),
-                            'Hit': stock_info.get('hit', 0)
-                        })
-
-        if records:
-            return pd.DataFrame(records)
-        return None
-
-    def _calculate_prediction_distribution(self, report):
-        """计算预测分布统计"""
-        result = {'folds': []}
-
-        for fold_result in report.get('fold_results', []):
-            fold = fold_result.get('fold', 0)
-            pred_std = fold_result.get('prediction_std', 0)
-
-            # 从 top_metrics 提取预测概率分布
-            top_metrics = fold_result.get('top_metrics', {})
-
-            fold_data = {
-                'fold': fold + 1,
-                'test_period': f"{fold_result.get('test_start_date', '')} to {fold_result.get('test_end_date', '')}",
-                'prediction_stats': {
-                    'std': pred_std,
-                    'ic': fold_result.get('ic', 0),
-                    'rank_ic': fold_result.get('rank_ic', 0)
-                }
-            }
-            result['folds'].append(fold_data)
-
-        # 计算整体统计
-        if result['folds']:
-            overall = report.get('overall_metrics', {})
-            result['overall'] = {
-                'avg_ic': overall.get('avg_ic', 0),
-                'avg_rank_ic': overall.get('avg_rank_ic', 0),
-                'avg_prediction_std': overall.get('avg_prediction_std', 0)
-            }
-
-        return result
-
-    def _extract_fold_metrics_detail(self, report):
-        """提取各 Fold 详细指标"""
-        result = {
-            'model_type': report['validation_config']['model_type'],
-            'horizon': report['validation_config']['horizon'],
-            'folds': []
-        }
-
-        for fold_result in report.get('fold_results', []):
-            fold_data = {
-                'fold': fold_result.get('fold', 0) + 1,
-                'train_period': f"{fold_result.get('train_start_date', '')} to {fold_result.get('train_end_date', '')}",
-                'test_period': f"{fold_result.get('test_start_date', '')} to {fold_result.get('test_end_date', '')}",
-                'metrics': {
-                    'ic': fold_result.get('ic', 0),
-                    'rank_ic': fold_result.get('rank_ic', 0),
-                    'accuracy': fold_result.get('accuracy', 0),
-                    'sharpe': fold_result.get('sharpe_ratio', 0),
-                    'max_drawdown': fold_result.get('max_drawdown', 0),
-                    'sortino': fold_result.get('sortino_ratio', 0),
-                    'win_rate': fold_result.get('win_rate', 0),
-                    'avg_return': fold_result.get('avg_return', 0)
-                },
-                'sample_counts': {
-                    'total': fold_result.get('num_samples', 0),
-                    'train': fold_result.get('num_train_samples', 0),
-                    'test': fold_result.get('num_test_samples', 0)
-                }
-            }
-            result['folds'].append(fold_data)
-
-        return result
-
-    def _extract_top_stocks_features(self, report, model):
-        """提取推荐股票的特征值"""
-        # 这个方法需要从原始预测数据中提取
-        # 由于当前数据结构限制，返回 None
-        # 实际实现需要在 _validate_fold 中保存更多数据
-        return None
-
-    def _analyze_errors(self, report):
-        """分析预测错误案例"""
-        from config import WATCHLIST
-
-        records = []
-        for fold_result in report.get('fold_results', []):
-            fold = fold_result.get('fold', 0)
-
-            # 从 top_metrics 中提取错误案例
-            top_metrics = fold_result.get('top_metrics', {})
-            error_cases = top_metrics.get('error_cases', [])
-
-            for case in error_cases:
-                code = case.get('code', '')
-                records.append({
-                    'Fold': fold + 1,
-                    'Date': case.get('date', ''),
-                    'Stock_Code': code,
-                    'Stock_Name': WATCHLIST.get(code, code),
-                    'Predict_Prob': case.get('predict_prob', 0),
-                    'Actual_Return': case.get('actual_return', 0),
-                    'Error_Type': case.get('error_type', ''),
-                    'Possible_Reason': case.get('reason', '')
-                })
-
-        if records:
-            return pd.DataFrame(records)
-        return None
-
-    def _analyze_sector_distribution(self, report):
-        """分析推荐股票的板块分布"""
-        from config import STOCK_SECTOR_MAPPING
-
-        result = {'folds': []}
-
-        for fold_result in report.get('fold_results', []):
-            fold = fold_result.get('fold', 0)
-            top_metrics = fold_result.get('top_metrics', {})
-
-            # 统计 Top 25% 股票的板块分布
-            sector_counts = {}
-            top_stocks = top_metrics.get('top25_stocks', [])
-            for stock in top_stocks:
-                code = stock.get('code', '')
-                sector = STOCK_SECTOR_MAPPING.get(code, 'unknown')
-                sector_counts[sector] = sector_counts.get(sector, 0) + 1
-
-            if sector_counts:
-                result['folds'].append({
-                    'fold': fold + 1,
-                    'sector_counts': sector_counts,
-                    'top_sector': max(sector_counts, key=sector_counts.get) if sector_counts else None
-                })
-
-        return result
-
-    def _calculate_feature_correlation(self, model, report):
-        """计算 Top 20 特征的相关性"""
-        if not hasattr(model, 'catboost_model') or model.catboost_model is None:
-            return None
-
-        try:
-            importances = model.catboost_model.get_feature_importance()
-            feature_names = model.feature_columns
-
-            # 获取 Top 20 特征
-            sorted_idx = np.argsort(importances)[::-1][:20]
-            top_features = [feature_names[i] for i in sorted_idx if i < len(feature_names)]
-
-            # 计算相关性需要原始数据，这里返回特征列表
-            # 实际相关性计算需要在有数据的情况下进行
-            return pd.DataFrame({
-                'Feature': top_features,
-                'Importance': [importances[i] for i in sorted_idx if i < len(importances)]
-            })
-        except Exception as e:
-            logger.warning(f"计算特征相关性失败: {e}")
-            return None
-
-    def _analyze_confidence_return(self, report):
-        """分析不同置信度区间的实际收益"""
-        result = {'confidence_bins': []}
-
-        # 定义置信度区间
-        bins = [
-            ('0.8-1.0', 0.8, 1.0),
-            ('0.7-0.8', 0.7, 0.8),
-            ('0.6-0.7', 0.6, 0.7),
-            ('0.5-0.6', 0.5, 0.6),
-            ('0.0-0.5', 0.0, 0.5)
-        ]
-
-        overall = report.get('overall_metrics', {})
-        top_metrics = overall.get('top_percentile_metrics', {})
-
-        # 从 top_metrics 提取
-        for label, low, high in bins:
-            # 使用已有的 top_metrics 数据
-            if label == '0.8-1.0':
-                bin_data = {
-                    'range': label,
-                    'count': top_metrics.get('top1_total_count', 0),
-                    'avg_return': top_metrics.get('top1_avg_return', 0),
-                    'hit_rate': top_metrics.get('top1_avg_win_rate', 0)
-                }
-            elif label == '0.7-0.8':
-                bin_data = {
-                    'range': label,
-                    'count': top_metrics.get('top5_total_count', 0),
-                    'avg_return': top_metrics.get('top5_avg_return', 0),
-                    'hit_rate': top_metrics.get('top5_avg_win_rate', 0)
-                }
-            else:
-                bin_data = {
-                    'range': label,
-                    'count': 0,
-                    'avg_return': 0,
-                    'hit_rate': 0
-                }
-            result['confidence_bins'].append(bin_data)
-
-        return result
-
-    def _generate_validation_summary(self, report, saved_files):
-        """生成验证摘要"""
-        config = report['validation_config']
-        overall = report.get('overall_metrics', {})
-
-        return {
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'model_type': config['model_type'],
-            'horizon': config['horizon'],
-            'num_folds': config['num_folds'],
-            'num_stocks': len(config['stock_list']),
-            'overall_metrics': {
-                'score': overall.get('overall_score', 0),
-                'rating': overall.get('overall_rating', ''),
-                'recommendation': overall.get('recommendation', ''),
-                'avg_sharpe': overall.get('avg_sharpe_ratio', 0),
-                'avg_ic': overall.get('avg_ic', 0),
-                'avg_rank_ic': overall.get('avg_rank_ic', 0)
-            },
-            'saved_files': list(saved_files.keys())
+            'md_file': md_file,
+            'detail_dir': detail_dir
         }
 
     def _generate_markdown_report(self, report, output_file):
@@ -1581,7 +1355,10 @@ class WalkForwardValidator:
                 f.write(f"- **平均夏普比率**: {overall['avg_sharpe_ratio']:.4f}\n")
                 f.write(f"- **平均最大回撤**: {overall['avg_max_drawdown']:.2%}\n")
                 f.write(f"- **平均索提诺比率**: {overall['avg_sortino_ratio']:.4f}\n")
-                f.write(f"- **平均信息比率**: {overall['avg_information_ratio']:.4f}\n\n")
+                f.write(f"- **平均信息比率**: {overall['avg_information_ratio']:.4f}\n")
+                # 新增 IC 和 Rank IC
+                f.write(f"- **平均 IC**: {overall.get('avg_ic', 0):.4f}\n")
+                f.write(f"- **平均 Rank IC**: {overall.get('avg_rank_ic', 0):.4f}\n\n")
 
             # 稳定性分析
             f.write("## 🔬 稳定性分析\n\n")
@@ -1594,85 +1371,18 @@ class WalkForwardValidator:
                 f.write(f"- **夏普比率标准差**: {overall['sharpe_std']:.4f}\n")
                 f.write(f"- **稳定性评级**: {overall['stability_rating']}\n\n")
 
-            # IC 指标分析（新增）
-            f.write("## 📐 IC 指标分析（选股能力评估）\n\n")
-            if not overall:
-                f.write("⚠️  所有 Fold 验证失败，无法计算 IC 指标\n\n")
-            else:
-                avg_ic = overall.get('avg_ic', 0)
-                avg_rank_ic = overall.get('avg_rank_ic', 0)
-                avg_pred_std = overall.get('avg_prediction_std', 0)
-                ic_std = overall.get('ic_std', 0)
-                rank_ic_std = overall.get('rank_ic_std', 0)
-
-                f.write("| 指标 | 数值 | 说明 |\n")
-                f.write("|------|------|------|\n")
-                f.write(f"| **IC** | {avg_ic:.4f} | 预测概率与实际收益的 Pearson 相关系数 |\n")
-                f.write(f"| **Rank IC** | {avg_rank_ic:.4f} | 预测排名与实际收益排名的 Spearman 相关系数 |\n")
-                f.write(f"| **预测分散度** | {avg_pred_std:.4f} | 预测概率标准差（避免\"全涨全跌\"） |\n")
-                f.write(f"| **IC 标准差** | {ic_std:.4f} | IC 稳定性 |\n")
-                f.write(f"| **Rank IC 标准差** | {rank_ic_std:.4f} | Rank IC 稳定性 |\n\n")
-
-                f.write("**IC 解读**：\n")
-                if avg_ic > 0.05:
-                    ic_rating = "⭐⭐⭐⭐⭐ 预测能力较强"
-                elif avg_ic > 0.02:
-                    ic_rating = "⭐⭐⭐⭐ 预测能力中等"
-                elif avg_ic > 0:
-                    ic_rating = "⭐⭐⭐ 预测能力较弱"
-                else:
-                    ic_rating = "⚠️ 无预测能力或负相关"
-                f.write(f"- IC = {avg_ic:.4f}：{ic_rating}\n")
-                f.write(f"- Rank IC 更稳健，对异常值不敏感\n")
-                f.write(f"- 预测分散度 > 0.1 表示预测有区分度，避免\"全涨全跌\"\n\n")
-
-            # 头部精度分析（新增）
-            f.write("## 🎯 头部精度分析（Top Percentile Accuracy）\n\n")
-            if overall and 'top_percentile_metrics' in overall and overall['top_percentile_metrics']:
-                top_metrics = overall['top_percentile_metrics']
-                f.write("预测概率最高的股票其实际收益分布：\n\n")
-                f.write("| 分位 | 平均收益 | 胜率 | 超额收益 | 样本数 | 评估 |\n")
-                f.write("|------|---------|------|---------|--------|------|\n")
-
-                for pct in [1, 5, 10, 20]:
-                    ret_key = f'top{pct}_avg_return'
-                    if ret_key in top_metrics:
-                        ret = top_metrics[ret_key]
-                        win = top_metrics.get(f'top{pct}_avg_win_rate', 0)
-                        exc = top_metrics.get(f'top{pct}_avg_excess', 0)
-                        cnt = top_metrics.get(f'top{pct}_total_count', 0)
-
-                        # 评估：超额收益 > 0 且胜率 > 50%
-                        if exc > 0 and win > 0.5:
-                            rating = "✅ 有效"
-                        elif exc > 0:
-                            rating = "⚠️ 超额为正"
-                        elif win > 0.5:
-                            rating = "⚠️ 胜率过半"
-                        else:
-                            rating = "❌ 无效"
-
-                        f.write(f"| **Top {pct}%** | {ret:.2%} | {win:.2%} | {exc:.2%} | {cnt} | {rating} |\n")
-
-                f.write("\n**解读**：\n")
-                f.write("- **平均收益**：该分位股票的平均实际收益\n")
-                f.write("- **胜率**：该分位股票中收益为正的比例\n")
-                f.write("- **超额收益**：该分位收益减去整体平均收益\n")
-                f.write("- 如果 Top 1%/5% 的超额收益显著为正，说明模型头部预测有效\n\n")
-            else:
-                f.write("⚠️ 样本不足，无法计算头部精度\n\n")
-
             # Fold详细结果
             f.write("## 📈 Fold 详细结果\n\n")
-            f.write("| Fold | 训练期间 | 测试期间 | 样本数 | 交易次数 | 收益率 | 胜率 | 准确率 | 夏普比率 | 最大回撤 |\n")
-            f.write("|------|---------|---------|-------|---------|-------|------|-------|---------|--------|\n")
+            f.write("| Fold | 训练期间 | 测试期间 | 样本数 | 交易次数 | 收益率 | 胜率 | 准确率 | 夏普比率 | 最大回撤 | IC | Rank IC |\n")
+            f.write("|------|---------|---------|-------|---------|-------|------|-------|---------|--------|------|--------|\n")
 
             for fold in folds:
                 f.write(f"| {fold['fold'] + 1} | {fold['train_start_date']} 至 {fold['train_end_date']} | "
                        f"{fold['test_start_date']} 至 {fold['test_end_date']} | {fold['num_test_samples']} | "
                        f"{fold.get('num_trades', 'N/A')} | "
                        f"{fold['avg_return']:.2%} | {fold['win_rate']:.2%} | {fold['accuracy']:.2%} | "
-                       f"{fold['sharpe_ratio']:.4f} | {fold['max_drawdown']:.2%} |\n")
+                       f"{fold['sharpe_ratio']:.4f} | {fold['max_drawdown']:.2%} | "
+                       f"{fold.get('ic', 0):.4f} | {fold.get('rank_ic', 0):.4f} |\n")
 
             f.write("\n")
 
@@ -1734,8 +1444,8 @@ def main():
 
     # 模型参数
     parser.add_argument('--model-type', type=str, default='catboost',
-                       choices=['catboost', 'catboost_ranker', 'lightgbm', 'gbdt'],
-                       help='模型类型 (默认: catboost，catboost_ranker 为排序模型)')
+                       choices=['catboost', 'lightgbm', 'gbdt'],
+                       help='模型类型 (默认: catboost)')
 
     # Walk-forward 参数
     parser.add_argument('--train-window', type=int, default=12,
@@ -1767,9 +1477,9 @@ def main():
     parser.add_argument('--use-feature-selection', action='store_true',
                        help='使用特征选择（默认: False，使用全量特征）')
 
-    # 并行执行参数
-    parser.add_argument('--n-jobs', type=int, default=1,
-                       help='并行执行的 fold 数量（-1 表示使用所有 CPU 核心，默认: 1 顺序执行）')
+    # 非对称损失函数参数
+    parser.add_argument('--fp-penalty', type=float, default=None,
+                       help='False Positive 惩罚系数（非对称损失函数），如 2.5 表示对FP错误施加2.5倍惩罚')
 
     args = parser.parse_args()
 
@@ -1795,7 +1505,7 @@ def main():
         horizon=args.horizon,
         confidence_threshold=args.confidence_threshold,
         use_feature_selection=args.use_feature_selection,
-        n_jobs=args.n_jobs
+        fp_penalty=args.fp_penalty
     )
 
     # 执行验证
@@ -1804,19 +1514,6 @@ def main():
 
         # 保存报告
         output_files = validator.save_report(report, args.output_dir)
-
-        # P9: 保存详细分析结果（10个文件）
-        if hasattr(validator, 'last_model') and validator.last_model is not None:
-            print(f"\n{'='*80}")
-            print("📊 保存详细分析结果...")
-            print(f"{'='*80}")
-            detailed_files = validator.save_detailed_results(report, validator.last_model, args.output_dir)
-            if detailed_files:
-                print(f"\n详细分析文件:")
-                for name, path in detailed_files.items():
-                    print(f"  - {name}: {path}")
-        else:
-            print("\n⚠️  无法保存详细分析结果：模型引用不存在")
 
         print(f"\n{'='*80}")
         print("✅ 验证完成")

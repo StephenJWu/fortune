@@ -42,6 +42,7 @@ from data_services.technical_analysis import TechnicalAnalyzer
 from data_services.fundamental_data import get_comprehensive_fundamental_data
 from data_services.volatility_model import GARCHVolatilityModel
 from data_services.regime_detector import RegimeDetector
+from data_services.calendar_features import CalendarFeatureCalculator
 from ml_services.base_model_processor import BaseModelProcessor
 from ml_services.us_market_data import us_market_data
 from ml_services.logger_config import get_logger
@@ -61,6 +62,161 @@ WATCHLIST = list(STOCK_NAMES.keys())
 
 # 训练股票列表（转换为列表格式）
 TRAINING_LIST = list(TRAINING_NAMES.keys())
+
+# 绝对价格特征排除列表（跨股票不可比，使用标准化版本代替）
+# 此列表被 feature_selection.py 导入使用，确保两处一致
+ABSOLUTE_PRICE_FEATURES = [
+    # 价格通道绝对值
+    'Channel_High_20d', 'Channel_Low_20d',
+    'Price_High_5d', 'Price_Low_5d',
+    # 支撑阻力绝对值
+    'Support_120d', 'Resistance_120d',
+    # 均线绝对值（使用 MA_Ratio 系列代替）
+    'MA5', 'MA10', 'MA20', 'MA50', 'MA60', 'MA100', 'MA120', 'MA200', 'MA250',
+    # 布林带绝对值（使用 BB_Ratio 系列代替）
+    'BB_upper', 'BB_lower', 'BB_middle',
+    # ATR 绝对值（使用 ATR_Pct 代替）
+    'ATR', 'ATR_MA', 'ATR_MA60', 'ATR_MA120',
+    # 成交额绝对值（使用 Turnover_Z_Score 代替）
+    'Turnover', 'Turnover_Mean_20', 'Turnover_Std_20',
+    # 成交量绝对值（使用 Volume_Ratio 系列代替）
+    'Volume_MA7', 'Volume_MA120', 'Volume_MA250',
+    'Volume_Mean_30d', 'Volume_Std_30d',  # 使用 Volume_Volatility (std/mean) 代替
+    'Vol_Mean_20', 'Vol_Std_20',  # 成交量滚动均值/标准差
+    # 技术指标绝对值
+    'MACD', 'MACD_signal',  # 使用 MACD_Hist 和 MACD_Hist_ROC 代替
+    # OBV 累积绝对值（使用 OBV_Trend 和 OBV_Change_5d 代替）
+    'OBV', 'OBV_MA5',
+    # VWAP 绝对价格（使用 VWAP_Ratio 代替）
+    'VWAP',
+    # 典型价格绝对值（VWAP 的中间变量）
+    'TP',
+    # 其他绝对值（中间变量）
+    'High_Max', 'Low_Min'
+]
+
+
+def _build_market_level_features():
+    """动态构建市场级特征列表（所有股票同值）
+
+    从各特征模块动态获取，确保与特征模块自动同步。
+    新增特征模块时，只需在模块中定义 get_feature_names()，
+    此处会自动包含，避免遗漏。
+
+    Returns:
+        list: 市场级特征名称列表
+    """
+    features = []
+
+    # 1. 恒指收益（6个）- 手动定义，非特征模块
+    features.extend([
+        'HSI_Return_1d', 'HSI_Return_3d', 'HSI_Return_5d',
+        'HSI_Return_10d', 'HSI_Return_20d', 'HSI_Return_60d',
+    ])
+
+    # 2. HSI 市场状态 - 从 RegimeDetector 动态获取，添加 HSI_ 前缀
+    for feat in RegimeDetector.get_feature_names():
+        features.append(f'HSI_{feat}')
+
+    # 3. 美股收益（6个）- 手动定义
+    features.extend([
+        'SP500_Return', 'SP500_Return_5d', 'SP500_Return_20d',
+        'NASDAQ_Return', 'NASDAQ_Return_5d', 'NASDAQ_Return_20d',
+    ])
+
+    # 4. VIX 波动率（5个）- 手动定义
+    features.extend([
+        'VIX', 'VIX_Change_5d', 'VIX_Level', 'VIX_Change', 'VIX_Ratio_MA20',
+    ])
+
+    # 5. 美债收益率（4个）- 手动定义
+    features.extend([
+        'US_10Y_Yield', 'US_10Y_Yield_Change',
+        'US10Y_Yield', 'US10Y_Yield_Change_5d',
+    ])
+
+    # 6. 市场状态 One-Hot（3个）- 手动定义
+    features.extend([
+        'Market_Regime_Ranging', 'Market_Regime_Normal', 'Market_Regime_Trending',
+    ])
+
+    # 7. GARCH 波动率 - 从 GARCHVolatilityModel 动态获取
+    features.extend(GARCHVolatilityModel.get_feature_names())
+
+    # 8. 日历效应 - 从 CalendarFeatureCalculator 动态获取
+    features.extend(CalendarFeatureCalculator.get_feature_names())
+
+    return features
+
+
+# 市场级特征（所有股票同值，需与网络特征交叉后使用）
+# 这些特征在同一天对所有股票具有完全相同的值，无法区分个股
+# 通过与网络社区特征交叉，使不同社区的股票对市场信号有不同响应
+# 使用动态构建函数，确保与特征模块自动同步
+MARKET_LEVEL_FEATURES = _build_market_level_features()
+
+
+# ========== 特征单调性定义 ==========
+# POSITIVE: 值越大越好（如中心性、收益率）
+# NEGATIVE: 值越大越差（如波动率、约束度）
+# NEUTRAL: 无明确方向（如市场状态）
+# 用于交叉特征时保持逻辑单调性
+
+NETWORK_FEATURE_MONOTONICITY = {
+    'net_inter_community_ratio': 'POSITIVE',      # 跨社区连接多 = 信息优势
+    'net_sector_cohesion': 'POSITIVE',            # 板块内聚度高 = 联动强
+    'net_composite_centrality': 'POSITIVE',       # 中心性高 = 影响力大
+    'net_community_centrality_rank': 'POSITIVE',  # 排名高 = 社区内地位高
+    'net_constraint': 'NEGATIVE',                  # 约束度高 = 信息劣势
+    'net_effective_size': 'POSITIVE',             # 有效规模大 = 信息网络大
+    'net_local_clustering': 'NEUTRAL',            # 混合：高聚类=板块共振但信息冗余
+}
+
+MARKET_FEATURE_MONOTONICITY = {
+    # 收益率类（正向）
+    'HSI_Return_1d': 'POSITIVE',
+    'HSI_Return_3d': 'POSITIVE',
+    'HSI_Return_5d': 'POSITIVE',
+    'HSI_Return_10d': 'POSITIVE',
+    'HSI_Return_20d': 'POSITIVE',
+    'HSI_Return_60d': 'POSITIVE',
+    'SP500_Return': 'POSITIVE',
+    'SP500_Return_5d': 'POSITIVE',
+    'SP500_Return_20d': 'POSITIVE',
+    'NASDAQ_Return': 'POSITIVE',
+    'NASDAQ_Return_5d': 'POSITIVE',
+    'NASDAQ_Return_20d': 'POSITIVE',
+
+    # 波动率类（负向）
+    'VIX': 'NEGATIVE',
+    'VIX_Change_5d': 'NEGATIVE',
+    'VIX_Level': 'NEGATIVE',
+    'VIX_Change': 'NEGATIVE',
+    'VIX_Ratio_MA20': 'NEGATIVE',
+    'GARCH_Conditional_Vol': 'NEGATIVE',
+    'GARCH_Vol_Ratio': 'NEGATIVE',
+    'GARCH_Vol_Change_5d': 'NEGATIVE',
+
+    # 利率类（中性）
+    'US_10Y_Yield': 'NEUTRAL',
+    'US_10Y_Yield_Change': 'NEUTRAL',
+    'US10Y_Yield': 'NEUTRAL',
+    'US10Y_Yield_Change_5d': 'NEUTRAL',
+
+    # 市场状态类
+    'HSI_Market_Regime': 'NEUTRAL',
+    'HSI_Regime_Prob_0': 'NEUTRAL',   # 震荡市概率
+    'HSI_Regime_Prob_1': 'POSITIVE',  # 牛市概率
+    'HSI_Regime_Prob_2': 'NEGATIVE',  # 熊市概率
+    'HSI_Regime_Duration': 'NEUTRAL',
+    'HSI_Regime_Transition_Prob': 'NEUTRAL',
+
+    # 日历效应类（中性）
+    'Month_Sin': 'NEUTRAL',
+    'Month_Cos': 'NEUTRAL',
+    'DOW_Sin': 'NEUTRAL',
+    'DOW_Cos': 'NEUTRAL',
+}
 
 # 获取日志记录器
 logger = get_logger('ml_trading_model')
@@ -630,6 +786,11 @@ class FeatureEngineer:
         df = self.tech_analyzer.calculate_bollinger_bands(df, period=20, std_dev=2)
         # 布林带宽度（震荡市识别特征）
         df['BB_Width'] = (df['BB_upper'] - df['BB_lower']) / df['BB_middle']
+        # 标准化特征：布林带相对位置（跨股票可比）
+        prev_close = df['Close'].shift(1)
+        df['BB_Upper_Ratio'] = df['BB_upper'] / prev_close
+        df['BB_Lower_Ratio'] = df['BB_lower'] / prev_close
+        df['BB_Middle_Ratio'] = df['BB_middle'] / prev_close
         # 布林带宽度归一化（相对于60日均值，使用滞后数据避免数据泄漏）
         df['BB_Width_MA60'] = df['BB_Width'].rolling(window=60, min_periods=1).mean().shift(1)
         df['BB_Width_Normalized'] = (df['BB_Width'].shift(1) - df['BB_Width_MA60']) / (df['BB_Width'].rolling(60, min_periods=1).std().shift(1) + 1e-10)
@@ -640,6 +801,9 @@ class FeatureEngineer:
         # ATR 比率（ATR相对于10日均线的比率，使用滞后数据避免数据泄漏）
         df['ATR_MA'] = df['ATR'].rolling(window=10, min_periods=1).mean().shift(1)
         df['ATR_Ratio'] = df['ATR'] / df['ATR_MA']
+        # 标准化特征：ATP百分比（ATR/价格，跨股票可比）
+        prev_close = df['Close'].shift(1)
+        df['ATR_Pct'] = df['ATR'] / prev_close
 
         # ========== 成交量相关 ==========
         df['Vol_MA20'] = df['Volume'].rolling(window=20, min_periods=1).mean().shift(1)
@@ -668,6 +832,8 @@ class FeatureEngineer:
         # ========== VWAP (成交量加权平均价，使用滞后数据避免数据泄漏) ==========
         df['TP'] = (df['High'].shift(1) + df['Low'].shift(1) + df['Close'].shift(1)) / 3
         df['VWAP'] = (df['TP'] * df['Volume']).rolling(window=20, min_periods=1).sum() / df['Volume'].rolling(window=20, min_periods=1).sum()
+        # VWAP 标准化特征（当前价格相对VWAP位置，跨股票可比）
+        df['VWAP_Ratio'] = df['Close'].shift(1) / df['VWAP']
 
         # ========== OBV (能量潮) ==========
         df['OBV'] = 0.0
@@ -725,8 +891,15 @@ class FeatureEngineer:
             lambda x: (x.iloc[-1] - x.min()) / (x.max() - x.min()) * 100
         ).shift(1)
         # 价格通道位置（震荡市识别特征，使用滞后数据避免数据泄漏）
+        # 保留中间变量用于计算其他特征，但不作为模型特征
         df['Channel_High_20d'] = df['High'].rolling(window=20, min_periods=1).max().shift(1)
         df['Channel_Low_20d'] = df['Low'].rolling(window=20, min_periods=1).min().shift(1)
+        # 标准化特征：价格通道相对位置（跨股票可比）
+        prev_close = df['Close'].shift(1)
+        df['Channel_High_Ratio_20d'] = df['Channel_High_20d'] / prev_close
+        df['Channel_Low_Ratio_20d'] = df['Channel_Low_20d'] / prev_close
+        df['Channel_Width_Ratio_20d'] = (df['Channel_High_20d'] - df['Channel_Low_20d']) / prev_close
+        # 价格在通道中的位置（0-1标准化）
         df['Price_Channel_Position_20d'] = (df['Close'] - df['Channel_Low_20d']) / (df['Channel_High_20d'] - df['Channel_Low_20d'] + 1e-10)
         # 价格在通道中的位置（靠近上轨/下轨/中轨）
         df['Price_Channel_Zone'] = np.where(
@@ -822,6 +995,8 @@ class FeatureEngineer:
         # OBV 趋势（使用滞后数据避免数据泄漏）
         df['OBV_MA5'] = df['OBV'].rolling(5).mean().shift(1)
         df['OBV_Trend'] = (df['OBV'] > df['OBV_MA5']).astype(int)
+        # OBV 变化率标准化特征（跨股票可比）
+        df['OBV_Change_5d'] = df['OBV'].pct_change(5).shift(1)
 
         # 成交量波动率（使用滞后数据避免数据泄漏）
         df['Volume_Volatility'] = df['Turnover'].shift(1).rolling(20).std() / (df['Turnover'].shift(1).rolling(20).mean() + 1e-10)
@@ -834,6 +1009,10 @@ class FeatureEngineer:
         # 长期均线（120日半年线、250日年线，使用滞后数据避免数据泄漏）
         df['MA120'] = df['Close'].rolling(window=120, min_periods=1).mean().shift(1)
         df['MA250'] = df['Close'].rolling(window=250, min_periods=1).mean().shift(1)
+        # 标准化特征：均线相对位置（跨股票可比）
+        prev_close = df['Close'].shift(1)
+        df['MA_Ratio_120d'] = df['MA120'] / prev_close
+        df['MA_Ratio_250d'] = df['MA250'] / prev_close
 
         # ========== 新增指标：趋势斜率 ==========
         # 计算趋势斜率（线性回归斜率）
@@ -937,8 +1116,13 @@ class FeatureEngineer:
         )
 
         # 长期支撑阻力位（基于120日高低点，使用滞后数据避免数据泄漏）
+        # 保留中间变量用于计算盈亏比，但不作为模型特征
         df['Support_120d'] = df['Low'].rolling(120, min_periods=1).min().shift(1)
         df['Resistance_120d'] = df['High'].rolling(120, min_periods=1).max().shift(1)
+        # 标准化特征：支撑阻力相对位置（跨股票可比）
+        prev_close = df['Close'].shift(1)
+        df['Support_Ratio_120d'] = df['Support_120d'] / prev_close
+        df['Resistance_Ratio_120d'] = df['Resistance_120d'] / prev_close
         df['Distance_Support_120d'] = (df['Close'] - df['Support_120d']) / df['Close']
         df['Distance_Resistance_120d'] = (df['Resistance_120d'] - df['Close']) / df['Close']
 
@@ -1020,6 +1204,10 @@ class FeatureEngineer:
         # 三周期均线排列（5/20/60日MA，与业界标准一致）
         df['MA5'] = df['Close'].rolling(window=5, min_periods=1).mean().shift(1)
         df['MA60'] = df['Close'].rolling(window=60, min_periods=1).mean().shift(1)
+        # 标准化特征：均线相对位置（跨股票可比）
+        prev_close = df['Close'].shift(1)
+        df['MA_Ratio_5d'] = df['MA5'] / prev_close
+        df['MA_Ratio_60d'] = df['MA60'] / prev_close
 
         # 三周期多头排列（5>20>60）
         df['MA_Alignment_Bullish_5_20_60'] = (
@@ -1517,10 +1705,6 @@ class FeatureEngineer:
     def create_market_environment_features(self, stock_df, hsi_df, us_market_df=None):
         """创建市场环境特征（包含港股和美股）
 
-        P7 优化（2026-05-04）：
-        - 添加环境状态特征（HSI_Volatility、Market_Activeness）
-        - 环境特征作为"开关"而非"预测变量"，让模型知道当前市场状态
-
         Args:
             stock_df: 股票数据
             hsi_df: 恒生指数数据
@@ -1539,45 +1723,6 @@ class FeatureEngineer:
 
         # 相对表现（相对于恒生指数）
         stock_df['Relative_Return'] = stock_df['Return_5d'] - stock_df['HSI_Return_5d']
-
-        # ========== P7 新增：环境状态特征 ==========
-        # 这些特征描述"市场环境"，而非"预测大盘方向"
-        # 让模型知道当前是"风大"还是"水静"，调整对微观特征的敏感度
-
-        # 1. HSI 波动率（环境状态，非预测变量）
-        # 描述当前市场的"波动基准"，帮助模型判断信号强弱
-        hsi_df = hsi_df.copy()
-        hsi_df['HSI_Volatility_5d'] = hsi_df['Close'].pct_change().rolling(5).std() * np.sqrt(252)
-        hsi_df['HSI_Volatility_20d'] = hsi_df['Close'].pct_change().rolling(20).std() * np.sqrt(252)
-        hsi_df['HSI_Volatility_Ratio'] = hsi_df['HSI_Volatility_5d'] / hsi_df['HSI_Volatility_20d']
-
-        # 2. 市场活跃度（成交量相对历史水平）
-        # 高活跃度 = 资金涌入，信号更可靠
-        hsi_df['HSI_Volume_MA20'] = hsi_df['Volume'].rolling(20).mean() if 'Volume' in hsi_df.columns else 1
-        hsi_df['Market_Activeness'] = hsi_df['Volume'] / hsi_df['HSI_Volume_MA20'] if 'Volume' in hsi_df.columns else 1.0
-
-        # 3. 市场宽度（涨跌比例，描述市场健康度）
-        # 这个特征需要从所有股票计算，暂时用 HSI 动量作为代理
-        hsi_df['HSI_Momentum_5d'] = hsi_df['Close'].pct_change(5)
-        hsi_df['HSI_Momentum_20d'] = hsi_df['Close'].pct_change(20)
-
-        # 4. VIX 水平分类（风险偏好状态）
-        # VIX < 15: 低波动，风险偏好高
-        # VIX 15-25: 正常
-        # VIX > 25: 高波动，风险规避
-        # 这个特征在 us_market_df 中处理
-
-        # 合并环境状态特征（shift 1 避免数据泄漏）
-        env_features = ['HSI_Volatility_5d', 'HSI_Volatility_20d', 'HSI_Volatility_Ratio',
-                        'Market_Activeness', 'HSI_Momentum_5d', 'HSI_Momentum_20d']
-        existing_env_features = [f for f in env_features if f in hsi_df.columns]
-        if existing_env_features:
-            # shift(1) 确保使用 T-1 日数据
-            hsi_env_shifted = hsi_df[existing_env_features].shift(1)
-            stock_df = stock_df.merge(
-                hsi_env_shifted,
-                left_index=True, right_index=True, how='left'
-            )
 
         # 如果提供了美股数据，合并美股特征
         if us_market_df is not None and not us_market_df.empty:
@@ -1602,19 +1747,10 @@ class FeatureEngineer:
                     left_index=True, right_index=True, how='left'
                 )
 
-            # ========== P7 新增：VIX 风险状态分类 ==========
-            if 'VIX_Level' in us_market_df.columns:
-                # VIX 风险状态（分类，非连续值）
-                # 让模型学习"在 VIX 高时如何调整策略"
-                vix = us_market_df['VIX_Level'].shift(1)
-                stock_df['VIX_Risk_State_Low'] = (vix < 15).astype(int)  # 低波动
-                stock_df['VIX_Risk_State_Normal'] = ((vix >= 15) & (vix < 25)).astype(int)  # 正常
-                stock_df['VIX_Risk_State_High'] = (vix >= 25).astype(int)  # 高波动
-
         return stock_df
 
-    def create_label(self, df, horizon, for_backtest=False, min_return_threshold=0.0, label_type='absolute', all_stocks_df=None):
-        """创建标签：未来涨跌（支持绝对标签和相对标签）
+    def create_label(self, df, horizon, for_backtest=False, min_return_threshold=0.0):
+        """创建标签：未来涨跌（考虑交易成本）
 
         根据业界最佳实践，标签定义应考虑交易成本，避免"纸上盈利"变成实际亏损。
         只有当预期收益 > 交易成本 + 最小盈利目标时才标记为正例。
@@ -1626,10 +1762,6 @@ class FeatureEngineer:
             min_return_threshold: 最小收益阈值（默认0%），用于过滤小额波动
                                  推荐值 = 双边交易成本(约0.5%) + 缓冲(0%)
                                  注意：当前设为0%以保持标签分布均衡，后续可调整
-            label_type: 标签类型
-                       - 'absolute': 绝对标签（收益 > 阈值）
-                       - 'relative': 相对标签（收益 > 当日所有股票中位数）
-            all_stocks_df: 所有股票的数据（用于计算相对标签的中位数），格式为 DataFrame，包含 Date 和 Future_Return 列
         """
         if df.empty or len(df) < horizon + 1:
             return df
@@ -1637,36 +1769,13 @@ class FeatureEngineer:
         # 计算未来收益率（累积收益）
         df['Future_Return'] = df['Close'].shift(-horizon) / df['Close'] - 1
 
-        if label_type == 'absolute':
-            # 绝对标签：收益 > 阈值
-            # 阈值化标签：只有当收益超过阈值时才标记为正例
-            # 原因：小幅波动（如0.5%）扣除交易成本后可能变成亏损
-            # 业界标准：min_return_threshold = 交易成本 + 最小盈利目标
-            df['Label'] = (df['Future_Return'] > min_return_threshold).astype(int)
-            df['Label_Threshold'] = min_return_threshold
+        # 阈值化标签：只有当收益超过阈值时才标记为正例
+        # 原因：小幅波动（如0.5%）扣除交易成本后可能变成亏损
+        # 业界标准：min_return_threshold = 交易成本 + 最小盈利目标
+        df['Label'] = (df['Future_Return'] > min_return_threshold).astype(int)
 
-        elif label_type == 'relative':
-            # 相对标签：收益 > 当日所有股票中位数
-            # 这种标签方式迫使模型学习"个股为什么比别人强"，而非"大盘会不会涨"
-            # 预期效果：全局特征（如美债利率）权重下降，个股特异性特征权重上升
-
-            if all_stocks_df is not None and 'Daily_Median_Return' in all_stocks_df.columns:
-                # 使用预先计算的中位数（推荐，避免重复计算）
-                df = df.merge(
-                    all_stocks_df[['Date', 'Daily_Median_Return']].drop_duplicates(),
-                    on='Date',
-                    how='left'
-                )
-            else:
-                # 从当前数据计算（仅适用于单只股票数据）
-                # 注意：这种方式下，相对标签等于绝对标签（因为只有一只股票）
-                df['Daily_Median_Return'] = df['Future_Return'].expanding().median()
-
-            df['Label'] = (df['Future_Return'] > df['Daily_Median_Return']).astype(int)
-            df['Label_Threshold'] = df['Daily_Median_Return']  # 记录动态阈值
-
-        else:
-            raise ValueError(f"不支持的标签类型: {label_type}，支持: 'absolute', 'relative'")
+        # 记录使用的阈值（用于后续分析）
+        df['Label_Threshold'] = min_return_threshold
 
         # 如果不是回测模式，移除最后horizon行（没有标签的数据）
         if not for_backtest:
@@ -2188,18 +2297,18 @@ class FeatureEngineer:
                         else:
                             # 板块未找到，使用默认值
                             features[f'sector_avg_change_{period}d'] = 0.0
-                            features[f'sector_rank_{period}d'] = 0
+                            features[f'sector_rank_{period}d'] = -1  # -1表示未知
                             features[f'sector_rising_ratio_{period}d'] = 0.5
                     else:
                         # 无法获取板块数据，使用默认值
                         features[f'sector_avg_change_{period}d'] = 0.0
-                        features[f'sector_rank_{period}d'] = 0
+                        features[f'sector_rank_{period}d'] = -1  # -1表示未知
                         features[f'sector_rising_ratio_{period}d'] = 0.5
 
                 except Exception as e:
                     logger.warning(f"计算板块表现失败 (period={period}): {e}")
                     features[f'sector_avg_change_{period}d'] = 0.0
-                    features[f'sector_rank_{period}d'] = 0
+                    features[f'sector_rank_{period}d'] = -1  # -1表示未知
                     features[f'sector_rising_ratio_{period}d'] = 0.5
 
             # 计算板块趋势
@@ -2635,19 +2744,29 @@ class FeatureEngineer:
             '3d_Trend', '5d_Trend', '10d_Trend', '20d_Trend', '60d_Trend'
         ]
 
-        # 方案1：定义重要的数值型特征（120个精选特征）
+        # 方案1：定义重要的数值型特征（精选特征）
         # 基于特征重要性实验和历史数据选择
+        # 注意：特征名必须与实际计算名称完全匹配
         important_numeric_features = [
-            # 技术指标（40个）
-            'RSI_14d', 'MACD', 'MACD_Signal', 'ATR_14d', 'BB_Width', 'BB_Position',
-            'Volume_MA20', 'Volume_Ratio_7d', 'Volume_Trend_5d', 'OBV',
-            'MA_Slope_20d', 'MA_Slope_60d', 'Price_Ratio_MA5', 'Price_Ratio_MA20',
-            'Distance_MA20', 'Distance_MA60', 'Above_MA20', 'Above_MA60',
-            'Volatility_20d', 'Volatility_60d', 'Kurtosis_20d', 'Skewness_20d',
-            'Price_Percentile_20d', 'Price_ZScore_20d', 'High_Low_Range_5d',
-            'Upper_Shadow_Ratio', 'Lower_Shadow_Ratio', 'Intraday_Amplitude',
-            'Gap_Up', 'Gap_Down', 'Gap_Size', 'Gap_Sign',
-            'RSI_Overbought', 'RSI_Oversold', 'MACD_Bullish', 'MACD_Bearish',
+            # 技术指标（使用标准化特征，避免绝对值）
+            'RSI', 'RSI_ROC', 'RSI_Deviation',  # RSI 系列（0-100 标准化）
+            'MACD_Hist', 'MACD_Hist_ROC',  # MACD 柱状图（差值，相对稳定）
+            'MACD_Low_5d_History', 'MACD_High_5d_History',  # MACD 历史极值
+            'RSI_Low_5d_History', 'RSI_High_5d_History',  # RSI 历史极值
+            'ATR_Pct', 'ATR_Ratio',  # ATR 标准化（百分比）
+            'BB_Width', 'BB_Position',  # 布林带宽度和位置
+            'Volume_Ratio_7d', 'Volume_Ratio_20d',  # 成交量比率
+            'OBV_Trend', 'OBV_Change_5d',  # OBV 趋势（标准化）
+            'VWAP_Ratio',  # VWAP 相对位置
+            'Trend_Slope_5d', 'Trend_Slope_20d', 'Trend_Slope_60d',  # 趋势斜率（标准化）
+            'Price_Ratio_MA5', 'Price_Ratio_MA20', 'Price_Ratio_MA50',  # 价格相对均线
+            'Volatility_5d', 'Volatility_20d', 'Volatility_60d',  # 波动率
+            'Kurtosis_20d', 'Skewness_20d',  # 高阶矩
+            'Price_Percentile', 'High_Position_60d',  # 价格位置
+            'Upper_Shadow', 'Lower_Shadow', 'Intraday_Amplitude',  # 日内形态
+            'Gap_Up', 'Gap_Down', 'Gap_Size',  # 缺口
+            'MACD_Bullish_Divergence', 'MACD_Bearish_Divergence',  # MACD 背离
+            'RSI_Bullish_Divergence', 'RSI_Bearish_Divergence',  # RSI 背离
             
             # 市场环境特征（20个）
             'VIX', 'VIX_Change_5d', 'VIX_Level',
@@ -2697,13 +2816,13 @@ class FeatureEngineer:
             'Sector_Leader'
         ]
 
-        # 排除列表
-        exclude_columns = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
-                          'Future_Return', 'Label', 'Prev_Close',
-                          'Vol_MA20', 'MA5', 'MA10', 'MA20', 'MA50', 'MA100', 'MA200',
-                          'BB_upper', 'BB_lower', 'BB_middle',
-                          'Returns', 'TP', 'MF_Multiplier', 'MF_Volume',
-                          'High_Max', 'Low_Min'] + categorical_features
+        # 排除列表（基础列 + 绝对价格特征 + 分类特征）
+        # 基础列：不作为特征使用的列
+        base_exclude = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
+                       'Future_Return', 'Label', 'Prev_Close',
+                       'Vol_MA20', 'Returns', 'TP', 'MF_Multiplier', 'MF_Volume']
+        # 使用模块级常量，避免重复定义
+        exclude_columns = base_exclude + ABSOLUTE_PRICE_FEATURES + categorical_features
 
         if limit_interaction_features:
             # 方案1：只对重要的数值型特征生成交叉特征
@@ -2735,6 +2854,225 @@ class FeatureEngineer:
         logger.info(f"成功生成 {interaction_count} 个交叉特征")
         return df
 
+    @staticmethod
+    def create_monotonic_interaction(df, feat1, feat2, name1, name2,
+                                       mono1='NEUTRAL', mono2='NEUTRAL'):
+        """创建保持单调性的交叉特征
+
+        根据特征的单调性方向，选择合适的交叉方式：
+        - 正向 × 正向 → 乘法（协同效应）
+        - 负向 × 负向 → 加权绝对值乘法（风险放大，保持负向）
+        - 正向 × 负向 → 除法（风险调整，平滑处理）
+        - 涉及中性 → 乘法（保守策略）
+
+        Args:
+            df: DataFrame
+            feat1, feat2: 特征列名
+            name1, name2: 特征名称（用于命名）
+            mono1, mono2: 特征单调性 ('POSITIVE', 'NEGATIVE', 'NEUTRAL')
+
+        Returns:
+            tuple: (特征名, 特征值) 或 (None, None)
+        """
+        if feat1 not in df.columns or feat2 not in df.columns:
+            return None, None
+
+        eps = 1e-6  # 平滑项，避免除零
+
+        if mono1 == 'NEGATIVE' and mono2 == 'NEGATIVE':
+            # 负向 × 负向：加权绝对值乘法
+            # 数学实现：-|X| × |Y|，保持负向含义，幅度放大
+            feature_name = f'{name1}_risk_{name2}'
+            feature_value = -1 * df[feat1].abs() * df[feat2].abs()
+
+        elif mono1 == 'POSITIVE' and mono2 == 'NEGATIVE':
+            # 正向 / 负向：风险调整收益比
+            # 数学实现：X / (|Y| + ε)，单位风险收益
+            feature_name = f'{name1}_per_{name2}'
+            feature_value = df[feat1] / (df[feat2].abs() + eps)
+
+        elif mono1 == 'NEGATIVE' and mono2 == 'POSITIVE':
+            # 负向 / 正向：风险调整
+            feature_name = f'{name1}_per_{name2}'
+            feature_value = df[feat1] / (df[feat2] + eps)
+
+        else:
+            # 其他情况：使用乘法（正向×正向、涉及中性）
+            feature_name = f'{name1}_{name2}'
+            feature_value = df[feat1] * df[feat2]
+
+        return feature_name, feature_value
+
+    def create_market_network_interaction_features(self, df, market_features=None, community_ids=None):
+        """创建市场级特征与网络社区特征的交叉特征
+
+        将市场级特征（所有股票同值）与网络社区特征交叉，
+        使不同社区的股票对市场信号有不同的响应权重。
+
+        Args:
+            df: 包含网络特征的 DataFrame
+            market_features: 市场级特征列表（默认使用 MARKET_LEVEL_FEATURES）
+            community_ids: 预定义的社区 ID 列表（训练时保存，预测时使用）
+                           如果为 None，则从当前数据动态提取（可能导致不一致）
+
+        Returns:
+            DataFrame: 添加交叉特征后的数据
+        """
+        if df.empty:
+            return df
+
+        # 使用默认市场级特征列表
+        if market_features is None:
+            market_features = MARKET_LEVEL_FEATURES
+
+        # 检查网络特征是否存在（使用新的连续值特征）
+        network_features = ['net_community_id', 'net_inter_community_ratio',
+                           'net_sector_cohesion', 'net_composite_centrality',
+                           'net_community_centrality_rank',
+                           'net_constraint', 'net_effective_size', 'net_local_clustering']
+        missing = [f for f in network_features if f not in df.columns]
+        if missing:
+            logger.debug(f"网络特征缺失，跳过市场-网络交叉: {missing}")
+            return df
+
+        interaction_count = 0
+
+        # 1. 社区 ID One-Hot 编码并交叉（保持不变）
+        if 'net_community_id' in df.columns:
+            # 使用预定义的社区 ID 列表（确保训练/预测一致）
+            if community_ids is not None:
+                unique_communities = community_ids
+                logger.debug(f"使用预定义社区 ID 列表: {unique_communities}")
+            else:
+                # 动态提取（可能导致训练/预测不一致）
+                unique_communities = sorted(df['net_community_id'].unique())
+                logger.warning(f"动态提取社区 ID（可能导致训练/预测不一致）: {unique_communities}")
+
+            for comm_id in unique_communities:
+                if comm_id < 0:  # 跳过无效社区
+                    continue
+                comm_col = f'net_comm_{int(comm_id)}'
+                # One-Hot 编码：如果股票属于该社区则为 1，否则为 0
+                df[comm_col] = (df['net_community_id'] == comm_id).astype(int)
+
+                # 与市场级特征交叉
+                for market_feat in market_features:
+                    if market_feat in df.columns:
+                        interaction_name = f'{comm_col}_{market_feat}'
+                        df[interaction_name] = df[comm_col] * df[market_feat]
+                        interaction_count += 1
+
+        # 2. 跨社区连接比例与市场特征交叉（正向特征）
+        if 'net_inter_community_ratio' in df.columns:
+            mono_net = NETWORK_FEATURE_MONOTONICITY.get('net_inter_community_ratio', 'POSITIVE')
+            for market_feat in market_features:
+                if market_feat in df.columns:
+                    mono_market = MARKET_FEATURE_MONOTONICITY.get(market_feat, 'NEUTRAL')
+                    feat_name, feat_value = self.create_monotonic_interaction(
+                        df, 'net_inter_community_ratio', market_feat,
+                        'net_inter_comm', market_feat,
+                        mono_net, mono_market
+                    )
+                    if feat_name:
+                        df[feat_name] = feat_value
+                        interaction_count += 1
+
+        # 3. 板块内聚度与市场特征交叉（正向特征）
+        if 'net_sector_cohesion' in df.columns:
+            mono_net = NETWORK_FEATURE_MONOTONICITY.get('net_sector_cohesion', 'POSITIVE')
+            for market_feat in market_features:
+                if market_feat in df.columns:
+                    mono_market = MARKET_FEATURE_MONOTONICITY.get(market_feat, 'NEUTRAL')
+                    feat_name, feat_value = self.create_monotonic_interaction(
+                        df, 'net_sector_cohesion', market_feat,
+                        'net_cohesion', market_feat,
+                        mono_net, mono_market
+                    )
+                    if feat_name:
+                        df[feat_name] = feat_value
+                        interaction_count += 1
+
+        # 4. 中心性与市场特征交叉（正向特征）
+        if 'net_composite_centrality' in df.columns:
+            mono_net = NETWORK_FEATURE_MONOTONICITY.get('net_composite_centrality', 'POSITIVE')
+            for market_feat in market_features:
+                if market_feat in df.columns:
+                    mono_market = MARKET_FEATURE_MONOTONICITY.get(market_feat, 'NEUTRAL')
+                    feat_name, feat_value = self.create_monotonic_interaction(
+                        df, 'net_composite_centrality', market_feat,
+                        'net_centrality', market_feat,
+                        mono_net, mono_market
+                    )
+                    if feat_name:
+                        df[feat_name] = feat_value
+                        interaction_count += 1
+
+        # 5. 社区内中心性排名与市场特征交叉（正向特征）
+        if 'net_community_centrality_rank' in df.columns:
+            mono_net = NETWORK_FEATURE_MONOTONICITY.get('net_community_centrality_rank', 'POSITIVE')
+            for market_feat in market_features:
+                if market_feat in df.columns:
+                    mono_market = MARKET_FEATURE_MONOTONICITY.get(market_feat, 'NEUTRAL')
+                    feat_name, feat_value = self.create_monotonic_interaction(
+                        df, 'net_community_centrality_rank', market_feat,
+                        'net_comm_rank', market_feat,
+                        mono_net, mono_market
+                    )
+                    if feat_name:
+                        df[feat_name] = feat_value
+                        interaction_count += 1
+
+        # 6. 结构洞约束 × 市场特征（负向特征）
+        # 低约束=信息优势大，高约束=信息劣势
+        # 与负向市场特征（如VIX）交叉时使用风险放大逻辑
+        if 'net_constraint' in df.columns:
+            mono_net = NETWORK_FEATURE_MONOTONICITY.get('net_constraint', 'NEGATIVE')
+            for market_feat in market_features:
+                if market_feat in df.columns:
+                    mono_market = MARKET_FEATURE_MONOTONICITY.get(market_feat, 'NEUTRAL')
+                    feat_name, feat_value = self.create_monotonic_interaction(
+                        df, 'net_constraint', market_feat,
+                        'net_constraint', market_feat,
+                        mono_net, mono_market
+                    )
+                    if feat_name:
+                        df[feat_name] = feat_value
+                        interaction_count += 1
+
+        # 7. 有效规模 × 市场特征（正向特征）
+        if 'net_effective_size' in df.columns:
+            mono_net = NETWORK_FEATURE_MONOTONICITY.get('net_effective_size', 'POSITIVE')
+            for market_feat in market_features:
+                if market_feat in df.columns:
+                    mono_market = MARKET_FEATURE_MONOTONICITY.get(market_feat, 'NEUTRAL')
+                    feat_name, feat_value = self.create_monotonic_interaction(
+                        df, 'net_effective_size', market_feat,
+                        'net_effsize', market_feat,
+                        mono_net, mono_market
+                    )
+                    if feat_name:
+                        df[feat_name] = feat_value
+                        interaction_count += 1
+
+        # 8. 局部聚类系数 × 市场特征（中性特征）
+        # 高聚类=板块共振强但信息冗余，使用乘法（保守策略）
+        if 'net_local_clustering' in df.columns:
+            mono_net = NETWORK_FEATURE_MONOTONICITY.get('net_local_clustering', 'NEUTRAL')
+            for market_feat in market_features:
+                if market_feat in df.columns:
+                    mono_market = MARKET_FEATURE_MONOTONICITY.get(market_feat, 'NEUTRAL')
+                    feat_name, feat_value = self.create_monotonic_interaction(
+                        df, 'net_local_clustering', market_feat,
+                        'net_clustering', market_feat,
+                        mono_net, mono_market
+                    )
+                    if feat_name:
+                        df[feat_name] = feat_value
+                        interaction_count += 1
+
+        logger.info(f"成功生成 {interaction_count} 个市场-网络交叉特征")
+        return df
+
 
 class BaseTradingModel:
     """交易模型基类 - 提供公共方法和属性"""
@@ -2746,6 +3084,7 @@ class BaseTradingModel:
         self.horizon = 1  # 默认预测周期
         self.model_type = None  # 子类必须设置
         self.categorical_encoders = {}
+        self.community_ids = None  # 训练时保存的社区 ID 列表
 
     def load_selected_features(self, filepath=None, current_feature_names=None):
         """加载选择的特征列表（使用特征名称交集，确保特征存在）
@@ -2827,106 +3166,118 @@ class BaseTradingModel:
 
     def get_feature_columns(self, df):
         """获取特征列（排除中间计算列）"""
-        # 排除非特征列（包括中间计算列）
-        exclude_columns = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
-                          'Future_Return', 'Label', 'Prev_Close',
-                          'Vol_MA20', 'MA5', 'MA10', 'MA20', 'MA50', 'MA100', 'MA200',
-                          'BB_upper', 'BB_lower', 'BB_middle',
-                          'Low_Min', 'High_Max', '+DM', '-DM', '+DI', '-DI',
-                          'TP', 'MF_Multiplier', 'MF_Volume']
+        # 基础排除列 + 中间计算列 + 绝对价格特征
+        base_exclude = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
+                       'Future_Return', 'Label', 'Prev_Close',
+                       'Vol_MA20', '+DM', '-DM', '+DI', '-DI']
+        exclude_columns = base_exclude + ABSOLUTE_PRICE_FEATURES
 
         feature_columns = [col for col in df.columns if col not in exclude_columns]
 
         return feature_columns
+
+    def prepare_features_for_selection(self, codes, horizon=20, sample_size=10):
+        """为特征选择准备数据（复用训练流程）
+
+        此方法被 feature_selection.py 调用，确保特征处理逻辑与训练完全一致。
+
+        Args:
+            codes: 股票代码列表
+            horizon: 预测周期（默认20天）
+            sample_size: 随机采样股票数量（默认10只，加速特征选择）
+
+        Returns:
+            tuple: (X, y, feature_columns)
+            - X: 特征矩阵 (numpy array)
+            - y: 目标变量 (numpy array)
+            - feature_columns: 特征名称列表
+        """
+        import random
+
+        # 固定随机种子，确保可重现性
+        random.seed(42)
+
+        # 随机采样股票（加速特征选择），sample_size=None 时使用全部股票
+        if sample_size is not None and len(codes) > sample_size:
+            codes = random.sample(codes, sample_size)
+
+        logger.info(f"准备特征选择数据: {len(codes)} 只股票")
+
+        # 预加载网络特征获取社区 ID
+        network_features_file = 'output/network_features_for_ml.json'
+        preloaded_community_ids = None
+        if os.path.exists(network_features_file):
+            try:
+                with open(network_features_file, 'r') as f:
+                    network_features_data = json.load(f)
+                all_community_ids = set()
+                for stock_code, net_features in network_features_data.items():
+                    if 'net_community_id' in net_features:
+                        comm_id = net_features['net_community_id']
+                        if comm_id >= 0:
+                            all_community_ids.add(int(comm_id))
+                if all_community_ids:
+                    preloaded_community_ids = sorted(list(all_community_ids))
+                    logger.info(f"预加载社区 ID: {preloaded_community_ids}")
+            except Exception as e:
+                logger.warning(f"预加载网络特征失败: {e}")
+
+        # 调用 prepare_data（子类实现）
+        df = self.prepare_data(codes, horizon=horizon, community_ids=preloaded_community_ids)
+
+        # 删除全为 NaN 的列
+        cols_all_nan = df.columns[df.isnull().all()].tolist()
+        if cols_all_nan:
+            logger.info(f"删除 {len(cols_all_nan)} 个全为NaN的列")
+            df = df.drop(columns=cols_all_nan)
+
+        # 删除标签和关键列的 NaN（与训练一致）
+        df = df.dropna(subset=['Label'])
+        critical_cols = ['Return_1d', 'Return_5d', 'Return_20d', 'Close', 'Volume']
+        df = df.dropna(subset=[c for c in critical_cols if c in df.columns])
+
+        # 确保数据按日期排序
+        df = df.sort_index()
+
+        # 获取特征列
+        feature_columns = self.get_feature_columns(df)
+        logger.info(f"使用 {len(feature_columns)} 个特征")
+
+        # 编码分类特征
+        categorical_features = []
+        for col in feature_columns:
+            if df[col].dtype == 'object' or df[col].dtype.name == 'category':
+                categorical_features.append(col)
+                from sklearn.preprocessing import LabelEncoder
+                le = LabelEncoder()
+                df[col] = df[col].fillna('unknown').astype(str)
+                df[col] = le.fit_transform(df[col])
+
+        if categorical_features:
+            logger.info(f"编码 {len(categorical_features)} 个分类特征")
+
+        # 准备特征矩阵和标签
+        X = df[feature_columns].values
+        y = df['Label'].values
+
+        # 确保是 float64 类型
+        if X.dtype == object:
+            X = X.astype(np.float64)
+
+        logger.info(f"数据准备完成: {len(X)} 样本, {len(feature_columns)} 特征")
+
+        return X, y, feature_columns
 
 
 class LightGBMModel(BaseTradingModel):
     """LightGBM 模型 - 基于 LightGBM 梯度提升算法的单一模型"""
     _deprecation_warning_shown = False  # 类变量，控制弃用警告只显示一次
 
-    # 截面百分位特征列表（P7 精简版，2026-05-04）
-    # 从 P6 的 ~100 个精简回核心高质量特征，去除高相关性冗余
-    # 原则：质量 > 数量，保留核心 Alpha 信号
-    CROSS_SECTIONAL_PERCENTILE_FEATURES = [
-        # ========== 波动率特征（保留核心，去除冗余）==========
-        'Volatility_5d', 'Volatility_20d', 'Volatility_60d',  # 短中长期
-        'GARCH_Conditional_Vol', 'Intraday_Range',  # 条件波动率、日内波幅
-        # ========== ATR特征（保留核心）==========
-        'ATR', 'ATR_Ratio', 'ATR_Risk_Score',
-        # ========== 成交量特征（保留核心）==========
-        'Volume_Ratio_5d', 'Volume_Ratio_20d', 'Volume_Volatility',
-        'OBV', 'CMF',  # 资金流向指标
-        # ========== 动量特征（保留核心，去除高相关变体）==========
-        'Momentum_20d', 'Momentum_Accel_5d', 'Momentum_Accel_20d',
-        'MACD_histogram', 'Close_Position',
-        # ========== RSI特征（保留核心）==========
-        'RSI', 'RSI_Deviation',
-        # ========== 相对强度特征（关键 Alpha 信号）==========
-        'RS_Ratio_5d', 'RS_Ratio_20d', 'RS_Diff_5d', 'RS_Diff_20d',
-        'Relative_Return',
-        # ========== 布林带/位置特征 ==========
-        'BB_Position', 'BB_Width',
-        # ========== 风险特征（保留核心）==========
-        'Max_Drawdown_20d', 'Max_Drawdown_60d',
-        'Vol_Z_Score', 'Kurtosis_20d', 'Skewness_20d',
-        # ========== 资金流向特征 ==========
-        'Smart_Money_Score', 'Accumulation_Score',
-        # ========== 基本面特征 ==========
-        'PE', 'PB', 'ROE', 'Market_Cap',
-        # ========== 异常检测特征（关键 Alpha 信号）==========
-        'Anomaly_Severity_Score', 'Anomaly_Buy_Signal',
-        # ========== 网络增量特征（P7 新增）==========
-        'net_node_deviation', 'net_node_deviation_delta_5d',
-    ]
-
-    # 截面 Z-Score 特征列表（2026-05-04 P6 扩展，与 CatBoost 保持一致）
-    CROSS_SECTIONAL_ZSCORE_FEATURES = [
-        # 成交量特征
-        'Volume', 'Turnover', 'Turnover_Mean_20',
-        'Volume_Std_30d', 'Volume_Z_Score',  # P6 新增
-        # 波动率特征
-        'Volatility_5d', 'Volatility_10d', 'Volatility_20d', 'Volatility_60d',
-        'GARCH_Conditional_Vol', 'GARCH_Vol_Ratio',
-        # ATR特征
-        'ATR', 'ATR_Ratio', 'ATR_Risk_Score',
-        'ATR_MA', 'ATR_MA60',  # P6 新增
-        # 成交量比率特征
-        'Volume_Ratio_5d', 'Volume_Ratio_20d', 'Volume_Volatility',
-        'OBV', 'CMF',
-        # 动量特征（P6 扩展）
-        'Momentum_20d', 'Momentum_Accel_5d', 'Momentum_Accel_10d',
-        'Momentum_Accel_20d', 'Momentum_Accel_60d',  # P6 新增
-        'MACD_histogram', 'MACD_Hist_ROC', 'Price_Pct_20d',
-        # RSI特征
-        'RSI', 'RSI_Deviation', 'RSI_ROC',
-        'RSI_Deviation_Normalized',  # P6 新增
-        # 相对强度特征
-        'RS_Ratio_5d', 'RS_Ratio_20d', 'RS_Diff_5d', 'RS_Diff_20d',
-        'Relative_Return', 'RS_Diff_1d',  # P6 新增
-        # 布林带/位置特征
-        'BB_Position', 'BB_Width', 'BB_Width_Normalized',
-        'MA5_Deviation_Std', 'MA20_Deviation_Std',
-        # 风险特征（P6 扩展）
-        'Max_Drawdown_20d', 'Max_Drawdown_60d',
-        'Vol_Z_Score', 'Kurtosis_20d', 'Kurtosis_5d', 'Kurtosis_10d',
-        'Skewness_5d', 'Skewness_10d', 'Skewness_20d',  # P6 新增
-        # 资金流向特征
-        'Smart_Money_Score', 'Accumulation_Score',
-        'Net_Flow_5d', 'Net_Flow_20d',
-        # 基本面特征
-        'PE', 'PB', 'ROE', 'Market_Cap',
-        # 异常检测特征（P6 新增）
-        'Anomaly_Severity_Score', 'Price_Anomaly_ZScore', 'Volume_Anomaly_ZScore',
-    ]
-
-    def __init__(self, use_cross_sectional_percentile=True, use_cross_sectional_zscore=True):
+    def __init__(self):
         super().__init__()  # 调用基类初始化
         self.model = None
         self.scaler = StandardScaler()
         self.model_type = 'lgbm'  # 模型类型标识
-        self.use_cross_sectional_percentile = use_cross_sectional_percentile
-        self.use_cross_sectional_zscore = use_cross_sectional_zscore
-        self.cs_feature_stats = {}  # 截面特征统计量
 
     def prepare_data(self, codes, start_date=None, end_date=None, horizon=1, for_backtest=False, min_return_threshold=0.0):
         """准备训练数据（80个指标版本，优化版）
@@ -3079,15 +3430,6 @@ class LightGBMModel(BaseTradingModel):
         # 按日期索引排序，确保时间顺序正确
         df = df.sort_index()
 
-        # 计算截面特征（必须在合并所有股票后计算）
-        if self.use_cross_sectional_percentile:
-            print("\n📊 计算截面百分位特征...")
-            df = self._calculate_cross_sectional_percentile_features(df)
-
-        if self.use_cross_sectional_zscore:
-            print("\n📊 计算截面Z-Score特征...")
-            df = self._calculate_cross_sectional_zscore_features(df)
-
         # 生成技术指标与基本面交互特征（先执行，因为这是高价值特征）
         print("\n🔗 生成技术指标与基本面交互特征...")
         df = self.feature_engineer.create_technical_fundamental_interactions(df)
@@ -3098,79 +3440,13 @@ class LightGBMModel(BaseTradingModel):
 
         return df
 
-    def _calculate_cross_sectional_percentile_features(self, df):
-        """计算截面百分位特征（在所有股票上联合计算）
-
-        Args:
-            df: 包含多只股票数据的DataFrame（必须含'Code'列）
-
-        Returns:
-            DataFrame: 添加了截面百分位特征的DataFrame
-        """
-        if 'Code' not in df.columns:
-            logger.warning("数据中没有'Code'列，无法计算截面百分位特征")
-            return df
-
-        df = df.copy()
-
-        for feature in self.CROSS_SECTIONAL_PERCENTILE_FEATURES:
-            if feature not in df.columns:
-                continue
-
-            cs_col = f'{feature}_CS_Pct'
-            if cs_col in df.columns:
-                continue
-
-            try:
-                df[cs_col] = df.groupby(df.index)[feature].transform(
-                    lambda x: (x.rank(method='average') - 1) / max(len(x) - 1, 1) if len(x) > 1 else 0.5
-                )
-            except Exception as e:
-                logger.debug(f"截面百分位特征计算失败 {feature}: {e}")
-
-        return df
-
-    def _calculate_cross_sectional_zscore_features(self, df):
-        """计算截面Z-Score特征（在所有股票上联合计算）
-
-        Args:
-            df: 包含多只股票数据的DataFrame（必须含'Code'列）
-
-        Returns:
-            DataFrame: 添加了截面Z-Score特征的DataFrame
-        """
-        if 'Code' not in df.columns:
-            logger.warning("数据中没有'Code'列，无法计算截面Z-Score特征")
-            return df
-
-        df = df.copy()
-
-        for feature in self.CROSS_SECTIONAL_ZSCORE_FEATURES:
-            if feature not in df.columns:
-                continue
-
-            cs_col = f'{feature}_CS_ZScore'
-            if cs_col in df.columns:
-                continue
-
-            try:
-                df[cs_col] = df.groupby(df.index)[feature].transform(
-                    lambda x: (x - x.mean()) / x.std() if len(x) > 1 and x.std() > 0 else 0.0
-                )
-            except Exception as e:
-                logger.debug(f"截面Z-Score特征计算失败 {feature}: {e}")
-
-        return df
-
     def get_feature_columns(self, df):
         """获取特征列"""
-        # 排除非特征列（包括中间计算列）
-        exclude_columns = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
-                          'Future_Return', 'Label', 'Prev_Close', 'Label_Threshold',
-                          'Vol_MA20', 'MA5', 'MA10', 'MA20', 'MA50', 'MA100', 'MA200',
-                          'BB_upper', 'BB_lower', 'BB_middle',
-                          'Low_Min', 'High_Max', '+DM', '-DM', '+DI', '-DI',
-                          'TP', 'MF_Multiplier', 'MF_Volume']
+        # 基础排除列 + 中间计算列 + 绝对价格特征
+        base_exclude = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
+                       'Future_Return', 'Label', 'Prev_Close', 'Label_Threshold',
+                       'Vol_MA20', '+DM', '-DM', '+DI', '-DI']
+        exclude_columns = base_exclude + ABSOLUTE_PRICE_FEATURES
 
         feature_columns = [col for col in df.columns if col not in exclude_columns]
 
@@ -3184,7 +3460,7 @@ class LightGBMModel(BaseTradingModel):
             start_date: 训练开始日期
             end_date: 训练结束日期
             horizon: 预测周期（1=次日，5=一周，20=一个月）
-            use_feature_selection: 是否使用特征选择（已弃用，默认False使用全量特征）
+            use_feature_selection: 是否使用特征选择
             min_return_threshold: 最小收益阈值（默认0%）
 
         Returns:
@@ -3193,15 +3469,13 @@ class LightGBMModel(BaseTradingModel):
         random.seed(42)
             特征重要性
         """
-        # 检查是否需要显示弃用警告
+        # 检查是否需要显示提示
         if use_feature_selection and not LightGBMModel._deprecation_warning_shown:
-            print("⚠️  警告：特征选择功能已弃用，建议使用全量特征（892个）。Walk-forward验证显示全量特征性能更好。")
+            print("💡 提示：使用特征选择，Walk-forward 验证显示夏普比率更优")
             LightGBMModel._deprecation_warning_shown = True
 
         print("准备训练数据...")
-        df = self.prepare_data(codes, start_date, end_date, horizon=horizon,
-                               min_return_threshold=min_return_threshold,
-                               label_type='relative')  # 个股选股模型使用相对标签
+        df = self.prepare_data(codes, start_date, end_date, horizon=horizon, min_return_threshold=min_return_threshold)
 
         # 先删除全为NaN的列（避免dropna删除所有行）
         cols_all_nan = df.columns[df.isnull().all()].tolist()
@@ -3209,8 +3483,16 @@ class LightGBMModel(BaseTradingModel):
             print(f"🗑️  删除 {len(cols_all_nan)} 个全为NaN的列")
             df = df.drop(columns=cols_all_nan)
 
-        # 删除包含NaN的行
-        df = df.dropna()
+        # 只删除标签为NaN的行，保留特征中的NaN（LightGBM原生支持NaN）
+        # LightGBM 的 use_missing=True 参数会自动处理缺失值
+        if 'Label' in df.columns:
+            df = df.dropna(subset=['Label'])
+
+        # 删除其他关键列的NaN（非基本面特征）
+        critical_cols = ['Return_1d', 'Return_5d', 'Return_20d', 'Close', 'Volume']
+        critical_cols_existing = [c for c in critical_cols if c in df.columns]
+        if critical_cols_existing:
+            df = df.dropna(subset=critical_cols_existing)
 
         # 确保数据按日期索引排序（dropna 可能会改变顺序）
         df = df.sort_index()
@@ -3224,12 +3506,12 @@ class LightGBMModel(BaseTradingModel):
 
         # 应用特征选择（可选）
         if use_feature_selection:
-            print("\n🎯 应用特征选择（LightGBM）...（已弃用）")
+            print("\n🎯 应用特征选择...")
             selected_features = self.load_selected_features(current_feature_names=self.feature_columns)
             if selected_features:
                 # 筛选特征列
                 self.feature_columns = [col for col in self.feature_columns if col in selected_features]
-                print(f"✅ 特征数量: {len(self.feature_columns)}（特征选择 - 已弃用）")
+                print(f"✅ 特征数量: {len(self.feature_columns)}（特征选择）")
             else:
                 logger.warning(r"未找到特征选择文件，使用全部特征")
         else:
@@ -3421,15 +3703,6 @@ class LightGBMModel(BaseTradingModel):
         print("\n特征重要性 Top 10:")
         print(feat_imp[['Feature', 'Gain_Importance', 'Impact_Direction']].head(10))
 
-        # 保存截面特征的训练集统计量，供单只股票预测时回退使用
-        self.cs_feature_stats = {}
-        for col in df.columns:
-            if col.endswith('_CS_Pct') or col.endswith('_CS_ZScore'):
-                self.cs_feature_stats[col] = {
-                    'mean': float(df[col].mean()),
-                    'std': float(df[col].std()),
-                }
-
         return feat_imp
 
     def predict(self, code, predict_date=None, horizon=None):
@@ -3577,250 +3850,13 @@ class LightGBMModel(BaseTradingModel):
             print(f"预测失败 {code}: {e}")
             return None
 
-    def _extract_raw_features_single(self, code, predict_date=None, horizon=None):
-        """提取单只股票的原始特征（不含截面特征），供批量预测使用
-
-        Args:
-            code: 股票代码
-            predict_date: 预测日期 (YYYY-MM-DD)
-            horizon: 预测周期
-
-        Returns:
-            DataFrame: 带特征的 stock_df（含 Code 列），或 None
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        try:
-            stock_code = code.replace('.HK', '')
-
-            # 获取股票数据
-            stock_df = get_hk_stock_data_tencent(stock_code, period_days=1460)
-            if stock_df is None or stock_df.empty:
-                return None
-
-            # 获取恒生指数数据
-            hsi_df = get_hsi_data_tencent(period_days=1460)
-            if hsi_df is None or hsi_df.empty:
-                return None
-
-            # 获取美股市场数据
-            us_market_df = us_market_data.get_all_us_market_data(period_days=1460)
-
-            # 如果指定了预测日期，过滤数据到该日期
-            if predict_date:
-                predict_date = pd.to_datetime(predict_date)
-                predict_date_str = predict_date.strftime('%Y-%m-%d')
-
-                if not isinstance(stock_df.index, pd.DatetimeIndex):
-                    stock_df.index = pd.to_datetime(stock_df.index)
-                if not isinstance(hsi_df.index, pd.DatetimeIndex):
-                    hsi_df.index = pd.to_datetime(hsi_df.index)
-                if us_market_df is not None and not isinstance(us_market_df.index, pd.DatetimeIndex):
-                    us_market_df.index = pd.to_datetime(us_market_df.index)
-
-                stock_df = stock_df[stock_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-                hsi_df = hsi_df[hsi_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-                if us_market_df is not None:
-                    us_market_df = us_market_df[us_market_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-
-                if stock_df.empty:
-                    logger.warning(f"股票 {code} 在日期 {predict_date_str} 之前没有数据")
-                    return None
-
-            # 计算技术指标
-            stock_df = self.feature_engineer.calculate_technical_features(stock_df)
-            stock_df = self.feature_engineer.calculate_multi_period_metrics(stock_df)
-            stock_df = self.feature_engineer.calculate_relative_strength(stock_df, hsi_df)
-            stock_df = self.feature_engineer.create_smart_money_features(stock_df)
-            stock_df = self.feature_engineer.create_market_environment_features(stock_df, hsi_df, us_market_df)
-
-            # 添加基本面特征
-            fundamental_features = self.feature_engineer.create_fundamental_features(code)
-            for key, value in fundamental_features.items():
-                stock_df[key] = value
-
-            # 添加股票类型特征
-            stock_type_features = self.feature_engineer.create_stock_type_features(code, stock_df)
-            for key, value in stock_type_features.items():
-                stock_df[key] = value
-
-            # 添加情感特征
-            sentiment_features = self.feature_engineer.create_sentiment_features(code, stock_df)
-            for key, value in sentiment_features.items():
-                stock_df[key] = value
-
-            # 添加主题特征
-            topic_features = self.feature_engineer.create_topic_features(code, stock_df)
-            for key, value in topic_features.items():
-                stock_df[key] = value
-
-            # 添加主题情感交互特征
-            topic_sentiment_interaction = self.feature_engineer.create_topic_sentiment_interaction_features(code, stock_df)
-            for key, value in topic_sentiment_interaction.items():
-                stock_df[key] = value
-
-            # 添加预期差距特征
-            expectation_gap = self.feature_engineer.create_expectation_gap_features(code, stock_df)
-            for key, value in expectation_gap.items():
-                stock_df[key] = value
-
-            # 添加板块特征
-            sector_features = self.feature_engineer.create_sector_features(code, stock_df)
-            for key, value in sector_features.items():
-                stock_df[key] = value
-
-            # 生成交互特征
-            stock_df = self.feature_engineer.create_technical_fundamental_interactions(stock_df)
-            stock_df = self.feature_engineer.create_interaction_features(stock_df)
-
-            # 添加股票代码列
-            stock_df['Code'] = code
-
-            return stock_df
-
-        except Exception as e:
-            logger.warning(f"提取特征失败 {code}: {e}")
-            return None
-
-    def _predict_from_features(self, code, latest_data, horizon=None):
-        """从特征数据进行预测（供 predict() 和 predict_batch() 共用）
-
-        Args:
-            code: 股票代码
-            latest_data: 单行 DataFrame，包含所有特征
-            horizon: 预测周期
-
-        Returns:
-            dict: 预测结果，或 None
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        try:
-            # 处理缺失的截面特征（使用训练集统计量回退）
-            cs_feature_suffixes = ['_CS_Pct', '_CS_ZScore']
-            for suffix in cs_feature_suffixes:
-                cs_features = [col for col in self.feature_columns if col.endswith(suffix)]
-                for cs_feat in cs_features:
-                    if cs_feat not in latest_data.columns:
-                        if hasattr(self, 'cs_feature_stats') and cs_feat in self.cs_feature_stats:
-                            latest_data[cs_feat] = self.cs_feature_stats[cs_feat]['mean']
-                        else:
-                            latest_data[cs_feat] = 0.5 if suffix == '_CS_Pct' else 0.0
-
-            # 处理分类特征
-            for col, encoder in self.categorical_encoders.items():
-                if col in latest_data.columns:
-                    try:
-                        latest_data[col] = encoder.transform(latest_data[col].astype(str))
-                    except ValueError:
-                        logger.warning(f"分类特征 {col} 包含训练时未见过的类别，使用默认值")
-                        latest_data[col] = 0
-
-            X = latest_data[self.feature_columns].values
-
-            # 预测
-            proba = self.model.predict_proba(X)[0]
-            prediction = self.model.predict(X)[0]
-
-            return {
-                'code': code,
-                'name': STOCK_NAMES.get(code, code),
-                'prediction': int(prediction),
-                'probability': float(proba[1]),
-                'current_price': float(latest_data['Close'].values[0]),
-                'date': latest_data.index[0]
-            }
-
-        except Exception as e:
-            logger.warning(f"预测失败 {code}: {e}")
-            return None
-
-    def predict_batch(self, codes, predict_date=None, horizon=None):
-        """批量预测：先提取所有股票特征，再统一计算截面特征，最后逐只预测
-
-        核心改进：截面特征（_CS_Pct, _CS_ZScore）在所有股票数据上联合计算，
-        确保训练/预测一致，而非单只股票时退化为 0.5/0.0。
-
-        Args:
-            codes: 股票代码列表
-            predict_date: 预测日期 (YYYY-MM-DD)
-            horizon: 预测周期
-
-        Returns:
-            list: 预测结果列表
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        if len(self.feature_columns) == 0:
-            raise ValueError("模型未训练，请先调用train()方法")
-
-        logger.info(f"LightGBM 开始批量预测 {len(codes)} 只股票...")
-
-        # 阶段1：逐只提取原始特征
-        all_features = {}
-        for code in codes:
-            stock_df = self._extract_raw_features_single(code, predict_date, horizon)
-            if stock_df is not None:
-                all_features[code] = stock_df
-
-        if not all_features:
-            logger.warning("LightGBM 批量预测：没有成功提取任何股票的特征")
-            return []
-
-        logger.info(f"LightGBM 成功提取 {len(all_features)} 只股票的特征")
-
-        # 阶段2：合并所有股票，计算截面特征
-        combined = pd.concat(all_features.values())
-
-        # 统一索引时区：将 tz-aware 时间戳转换为 tz-naive，避免 groupby 时比较错误
-        if hasattr(combined.index, 'tz') and combined.index.tz is not None:
-            combined.index = combined.index.tz_localize(None)
-        elif hasattr(combined.index, 'tz_localize'):
-            try:
-                combined.index = combined.index.tz_convert('UTC').tz_localize(None)
-            except Exception:
-                combined.index = pd.to_datetime(combined.index).tz_localize(None)
-
-        # 计算截面百分位特征
-        if self.use_cross_sectional_percentile:
-            combined = self._calculate_cross_sectional_percentile_features(combined)
-            logger.info("LightGBM 批量预测：截面百分位特征计算完成")
-
-        # 计算截面 Z-Score 特征
-        if self.use_cross_sectional_zscore:
-            combined = self._calculate_cross_sectional_zscore_features(combined)
-            logger.info("LightGBM 批量预测：截面 Z-Score 特征计算完成")
-
-        # 阶段3：逐只预测（使用正确的截面特征）
-        results = []
-        for code in all_features.keys():
-            stock_data = combined[combined['Code'] == code]
-            if stock_data.empty:
-                continue
-
-            latest = stock_data.iloc[-1:].copy()
-
-            # 使用辅助方法进行预测
-            result = self._predict_from_features(code, latest, horizon)
-            if result:
-                results.append(result)
-
-        logger.info(f"LightGBM 批量预测完成：{len(results)}/{len(codes)} 只股票")
-        return results
-
     def save_model(self, filepath):
         """保存模型"""
         model_data = {
             'model': self.model,
             'scaler': self.scaler,
             'feature_columns': self.feature_columns,
-            'categorical_encoders': self.categorical_encoders,
-            'use_cross_sectional_percentile': self.use_cross_sectional_percentile,
-            'use_cross_sectional_zscore': self.use_cross_sectional_zscore,
-            'cs_feature_stats': getattr(self, 'cs_feature_stats', {})
+            'categorical_encoders': self.categorical_encoders
         }
         with open(filepath, 'wb') as f:
             pickle.dump(model_data, f)
@@ -3834,9 +3870,6 @@ class LightGBMModel(BaseTradingModel):
         self.scaler = model_data['scaler']
         self.feature_columns = model_data['feature_columns']
         self.categorical_encoders = model_data.get('categorical_encoders', {})
-        self.use_cross_sectional_percentile = model_data.get('use_cross_sectional_percentile', True)
-        self.use_cross_sectional_zscore = model_data.get('use_cross_sectional_zscore', True)
-        self.cs_feature_stats = model_data.get('cs_feature_stats', {})
         print(f"模型已从 {filepath} 加载")
 
 
@@ -3844,82 +3877,11 @@ class GBDTModel(BaseTradingModel):
     """GBDT 模型 - 基于梯度提升决策树的单一模型"""
     _deprecation_warning_shown = False  # 类变量，控制弃用警告只显示一次
 
-    # 截面百分位特征列表（P7 精简版，2026-05-04）
-    # 从 P6 的 ~100 个精简回核心高质量特征，去除高相关性冗余
-    # 原则：质量 > 数量，保留核心 Alpha 信号
-    CROSS_SECTIONAL_PERCENTILE_FEATURES = [
-        # ========== 波动率特征（保留核心，去除冗余）==========
-        'Volatility_5d', 'Volatility_20d', 'Volatility_60d',  # 短中长期
-        'GARCH_Conditional_Vol', 'Intraday_Range',  # 条件波动率、日内波幅
-        # ========== ATR特征（保留核心）==========
-        'ATR', 'ATR_Ratio', 'ATR_Risk_Score',
-        # ========== 成交量特征（保留核心）==========
-        'Volume_Ratio_5d', 'Volume_Ratio_20d', 'Volume_Volatility',
-        'OBV', 'CMF',  # 资金流向指标
-        # ========== 动量特征（保留核心，去除高相关变体）==========
-        'Momentum_20d', 'Momentum_Accel_5d', 'Momentum_Accel_20d',
-        'MACD_histogram', 'Close_Position',
-        # ========== RSI特征（保留核心）==========
-        'RSI', 'RSI_Deviation',
-        # ========== 相对强度特征（关键 Alpha 信号）==========
-        'RS_Ratio_5d', 'RS_Ratio_20d', 'RS_Diff_5d', 'RS_Diff_20d',
-        'Relative_Return',
-        # ========== 布林带/位置特征 ==========
-        'BB_Position', 'BB_Width',
-        # ========== 风险特征（保留核心）==========
-        'Max_Drawdown_20d', 'Max_Drawdown_60d',
-        'Vol_Z_Score', 'Kurtosis_20d', 'Skewness_20d',
-        # ========== 资金流向特征 ==========
-        'Smart_Money_Score', 'Accumulation_Score',
-        # ========== 基本面特征 ==========
-        'PE', 'PB', 'ROE', 'Market_Cap',
-        # ========== 异常检测特征（关键 Alpha 信号）==========
-        'Anomaly_Severity_Score', 'Anomaly_Buy_Signal',
-        # ========== 网络增量特征（P7 新增）==========
-        'net_node_deviation', 'net_node_deviation_delta_5d',
-    ]
-
-    # 截面 Z-Score 特征列表（P7 精简版，2026-05-04）
-    CROSS_SECTIONAL_ZSCORE_FEATURES = [
-        # 成交量特征
-        'Volume', 'Turnover', 'Turnover_Mean_20',
-        # 波动率特征
-        'Volatility_5d', 'Volatility_20d', 'Volatility_60d',
-        'GARCH_Conditional_Vol',
-        # ATR特征
-        'ATR', 'ATR_Ratio',
-        # 成交量比率特征
-        'Volume_Ratio_5d', 'Volume_Ratio_20d',
-        'OBV', 'CMF',
-        # 动量特征
-        'Momentum_20d', 'Momentum_Accel_5d', 'Momentum_Accel_20d',
-        'MACD_histogram',
-        # RSI特征
-        'RSI', 'RSI_Deviation',
-        # 相对强度特征
-        'RS_Ratio_5d', 'RS_Ratio_20d', 'RS_Diff_5d', 'RS_Diff_20d',
-        'Relative_Return',
-        # 布林带/位置特征
-        'BB_Position', 'BB_Width',
-        # 风险特征
-        'Max_Drawdown_20d', 'Max_Drawdown_60d',
-        'Vol_Z_Score', 'Kurtosis_20d', 'Skewness_20d',
-        # 资金流向特征
-        'Smart_Money_Score', 'Accumulation_Score',
-        # 基本面特征
-        'PE', 'PB', 'ROE', 'Market_Cap',
-        # 网络增量特征（P7 新增）
-        'net_node_deviation', 'net_node_deviation_delta_5d',
-    ]
-
-    def __init__(self, use_cross_sectional_percentile=True, use_cross_sectional_zscore=True):
+    def __init__(self):
         super().__init__()  # 调用基类初始化
         self.gbdt_model = None
         self.actual_n_estimators = 0
         self.model_type = 'gbdt'  # 模型类型标识
-        self.use_cross_sectional_percentile = use_cross_sectional_percentile
-        self.use_cross_sectional_zscore = use_cross_sectional_zscore
-        self.cs_feature_stats = {}  # 截面特征统计量
 
     def load_selected_features(self, filepath=None, current_feature_names=None):
         """加载选择的特征列表（使用特征名称交集，确保特征存在）
@@ -4131,15 +4093,6 @@ class GBDTModel(BaseTradingModel):
         # 按日期索引排序，确保时间顺序正确
         df = df.sort_index()
 
-        # 计算截面特征（必须在合并所有股票后计算）
-        if self.use_cross_sectional_percentile:
-            print("\n📊 计算截面百分位特征...")
-            df = self._calculate_cross_sectional_percentile_features(df)
-
-        if self.use_cross_sectional_zscore:
-            print("\n📊 计算截面Z-Score特征...")
-            df = self._calculate_cross_sectional_zscore_features(df)
-
         # 生成技术指标与基本面交互特征（先执行，因为这是高价值特征）
         print("\n🔗 生成技术指标与基本面交互特征...")
         df = self.feature_engineer.create_technical_fundamental_interactions(df)
@@ -4150,79 +4103,13 @@ class GBDTModel(BaseTradingModel):
 
         return df
 
-    def _calculate_cross_sectional_percentile_features(self, df):
-        """计算截面百分位特征（在所有股票上联合计算）
-
-        Args:
-            df: 包含多只股票数据的DataFrame（必须含'Code'列）
-
-        Returns:
-            DataFrame: 添加了截面百分位特征的DataFrame
-        """
-        if 'Code' not in df.columns:
-            logger.warning("数据中没有'Code'列，无法计算截面百分位特征")
-            return df
-
-        df = df.copy()
-
-        for feature in self.CROSS_SECTIONAL_PERCENTILE_FEATURES:
-            if feature not in df.columns:
-                continue
-
-            cs_col = f'{feature}_CS_Pct'
-            if cs_col in df.columns:
-                continue
-
-            try:
-                df[cs_col] = df.groupby(df.index)[feature].transform(
-                    lambda x: (x.rank(method='average') - 1) / max(len(x) - 1, 1) if len(x) > 1 else 0.5
-                )
-            except Exception as e:
-                logger.debug(f"截面百分位特征计算失败 {feature}: {e}")
-
-        return df
-
-    def _calculate_cross_sectional_zscore_features(self, df):
-        """计算截面Z-Score特征（在所有股票上联合计算）
-
-        Args:
-            df: 包含多只股票数据的DataFrame（必须含'Code'列）
-
-        Returns:
-            DataFrame: 添加了截面Z-Score特征的DataFrame
-        """
-        if 'Code' not in df.columns:
-            logger.warning("数据中没有'Code'列，无法计算截面Z-Score特征")
-            return df
-
-        df = df.copy()
-
-        for feature in self.CROSS_SECTIONAL_ZSCORE_FEATURES:
-            if feature not in df.columns:
-                continue
-
-            cs_col = f'{feature}_CS_ZScore'
-            if cs_col in df.columns:
-                continue
-
-            try:
-                df[cs_col] = df.groupby(df.index)[feature].transform(
-                    lambda x: (x - x.mean()) / x.std() if len(x) > 1 and x.std() > 0 else 0.0
-                )
-            except Exception as e:
-                logger.debug(f"截面Z-Score特征计算失败 {feature}: {e}")
-
-        return df
-
     def get_feature_columns(self, df):
         """获取特征列"""
-        # 排除非特征列（包括中间计算列）
-        exclude_columns = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
-                          'Future_Return', 'Label', 'Prev_Close', 'Label_Threshold',
-                          'Vol_MA20', 'MA5', 'MA10', 'MA20', 'MA50', 'MA100', 'MA200',
-                          'BB_upper', 'BB_lower', 'BB_middle',
-                          'Low_Min', 'High_Max', '+DM', '-DM', '+DI', '-DI',
-                          'TP', 'MF_Multiplier', 'MF_Volume']
+        # 基础排除列 + 中间计算列 + 绝对价格特征
+        base_exclude = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
+                       'Future_Return', 'Label', 'Prev_Close', 'Label_Threshold',
+                       'Vol_MA20', '+DM', '-DM', '+DI', '-DI']
+        exclude_columns = base_exclude + ABSOLUTE_PRICE_FEATURES
 
         feature_columns = [col for col in df.columns if col not in exclude_columns]
 
@@ -4236,15 +4123,15 @@ class GBDTModel(BaseTradingModel):
             start_date: 训练开始日期
             end_date: 训练结束日期
             horizon: 预测周期（1=次日，5=一周，20=一个月）
-            use_feature_selection: 是否使用特征选择（已弃用，默认False使用全量特征）
+            use_feature_selection: 是否使用特征选择
             min_return_threshold: 最小收益阈值（默认0%）
         """
         # 设置固定随机种子（确保模型训练的可重现性）
         np.random.seed(42)
         random.seed(42)
-        # 检查是否需要显示弃用警告
+        # 检查是否需要显示提示
         if use_feature_selection and not GBDTModel._deprecation_warning_shown:
-            print("⚠️  警告：特征选择功能已弃用，建议使用全量特征（892个）。Walk-forward验证显示全量特征性能更好。")
+            print("💡 提示：使用特征选择，Walk-forward 验证显示夏普比率更优")
             GBDTModel._deprecation_warning_shown = True
 
         print("="*70)
@@ -4253,9 +4140,7 @@ class GBDTModel(BaseTradingModel):
 
         # 准备数据
         logger.info("准备训练数据...")
-        df = self.prepare_data(codes, start_date, end_date, horizon=horizon,
-                               min_return_threshold=min_return_threshold,
-                               label_type='relative')  # 个股选股模型使用相对标签
+        df = self.prepare_data(codes, start_date, end_date, horizon=horizon, min_return_threshold=min_return_threshold)
 
         # 先删除全为NaN的列（避免dropna删除所有行）
         cols_all_nan = df.columns[df.isnull().all()].tolist()
@@ -4263,8 +4148,15 @@ class GBDTModel(BaseTradingModel):
             print(f"🗑️  删除 {len(cols_all_nan)} 个全为NaN的列")
             df = df.drop(columns=cols_all_nan)
 
-        # 删除包含NaN的行
-        df = df.dropna()
+        # 只删除标签为NaN的行，保留特征中的NaN（XGBoost原生支持NaN）
+        if 'Label' in df.columns:
+            df = df.dropna(subset=['Label'])
+
+        # 删除其他关键列的NaN（非基本面特征）
+        critical_cols = ['Return_1d', 'Return_5d', 'Return_20d', 'Close', 'Volume']
+        critical_cols_existing = [c for c in critical_cols if c in df.columns]
+        if critical_cols_existing:
+            df = df.dropna(subset=critical_cols_existing)
 
         # 确保数据按日期索引排序（dropna 可能会改变顺序）
         df = df.sort_index()
@@ -4278,12 +4170,12 @@ class GBDTModel(BaseTradingModel):
 
         # 应用特征选择（可选）
         if use_feature_selection:
-            print("\n🎯 应用特征选择（GBDT）...（已弃用）")
+            print("\n🎯 应用特征选择...")
             selected_features = self.load_selected_features(current_feature_names=self.feature_columns)
             if selected_features:
                 # 筛选特征列
                 self.feature_columns = [col for col in self.feature_columns if col in selected_features]
-                print(f"✅ 特征数量: {len(self.feature_columns)}（特征选择 - 已弃用）")
+                print(f"✅ 特征数量: {len(self.feature_columns)}（特征选择）")
             else:
                 logger.warning(r"未找到特征选择文件，使用全部特征")
         else:
@@ -4492,15 +4384,6 @@ class GBDTModel(BaseTradingModel):
         logger.info(r"GBDT 模型训练完成！")
         print("="*70)
 
-        # 保存截面特征的训练集统计量，供单只股票预测时回退使用
-        self.cs_feature_stats = {}
-        for col in df.columns:
-            if col.endswith('_CS_Pct') or col.endswith('_CS_ZScore'):
-                self.cs_feature_stats[col] = {
-                    'mean': float(df[col].mean()),
-                    'std': float(df[col].std()),
-                }
-
         return feat_imp
 
     def predict(self, code, predict_date=None, horizon=None):
@@ -4650,239 +4533,11 @@ class GBDTModel(BaseTradingModel):
             traceback.print_exc()
             return None
 
-    def _extract_raw_features_single(self, code, predict_date=None, horizon=None):
-        """提取单只股票的原始特征（不含截面特征），供批量预测使用
-
-        Args:
-            code: 股票代码
-            predict_date: 预测日期 (YYYY-MM-DD)
-            horizon: 预测周期
-
-        Returns:
-            DataFrame: 带特征的 stock_df（含 Code 列），或 None
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        try:
-            stock_code = code.replace('.HK', '')
-
-            # 获取股票数据
-            stock_df = get_hk_stock_data_tencent(stock_code, period_days=1460)
-            if stock_df is None or stock_df.empty:
-                return None
-
-            # 获取恒生指数数据
-            hsi_df = get_hsi_data_tencent(period_days=1460)
-            if hsi_df is None or hsi_df.empty:
-                return None
-
-            # 获取美股市场数据
-            us_market_df = us_market_data.get_all_us_market_data(period_days=1460)
-
-            # 如果指定了预测日期，过滤数据到该日期
-            if predict_date:
-                predict_date = pd.to_datetime(predict_date)
-                predict_date_str = predict_date.strftime('%Y-%m-%d')
-
-                if not isinstance(stock_df.index, pd.DatetimeIndex):
-                    stock_df.index = pd.to_datetime(stock_df.index)
-                if not isinstance(hsi_df.index, pd.DatetimeIndex):
-                    hsi_df.index = pd.to_datetime(hsi_df.index)
-                if us_market_df is not None and not isinstance(us_market_df.index, pd.DatetimeIndex):
-                    us_market_df.index = pd.to_datetime(us_market_df.index)
-
-                stock_df = stock_df[stock_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-                hsi_df = hsi_df[hsi_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-                if us_market_df is not None:
-                    us_market_df = us_market_df[us_market_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-
-                if stock_df.empty:
-                    logger.warning(f"股票 {code} 在日期 {predict_date_str} 之前没有数据")
-                    return None
-
-            # 计算技术指标
-            stock_df = self.feature_engineer.calculate_technical_features(stock_df)
-            stock_df = self.feature_engineer.calculate_multi_period_metrics(stock_df)
-            stock_df = self.feature_engineer.calculate_relative_strength(stock_df, hsi_df)
-            stock_df = self.feature_engineer.create_smart_money_features(stock_df)
-            stock_df = self.feature_engineer.create_market_environment_features(stock_df, hsi_df, us_market_df)
-
-            # 添加基本面特征
-            fundamental_features = self.feature_engineer.create_fundamental_features(code)
-            for key, value in fundamental_features.items():
-                stock_df[key] = value
-
-            # 添加股票类型特征
-            stock_type_features = self.feature_engineer.create_stock_type_features(code, stock_df)
-            for key, value in stock_type_features.items():
-                stock_df[key] = value
-
-            # 添加情感特征
-            sentiment_features = self.feature_engineer.create_sentiment_features(code, stock_df)
-            for key, value in sentiment_features.items():
-                stock_df[key] = value
-
-            # 添加主题特征
-            topic_features = self.feature_engineer.create_topic_features(code, stock_df)
-            for key, value in topic_features.items():
-                stock_df[key] = value
-
-            # 添加主题情感交互特征
-            topic_sentiment_interaction = self.feature_engineer.create_topic_sentiment_interaction_features(code, stock_df)
-            for key, value in topic_sentiment_interaction.items():
-                stock_df[key] = value
-
-            # 添加预期差距特征
-            expectation_gap = self.feature_engineer.create_expectation_gap_features(code, stock_df)
-            for key, value in expectation_gap.items():
-                stock_df[key] = value
-
-            # 添加板块特征
-            sector_features = self.feature_engineer.create_sector_features(code, stock_df)
-            for key, value in sector_features.items():
-                stock_df[key] = value
-
-            # 生成交互特征
-            stock_df = self.feature_engineer.create_technical_fundamental_interactions(stock_df)
-            stock_df = self.feature_engineer.create_interaction_features(stock_df)
-
-            # 添加股票代码列
-            stock_df['Code'] = code
-
-            return stock_df
-
         except Exception as e:
-            logger.warning(f"提取特征失败 {code}: {e}")
+            print(f"预测失败 {code}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
-
-    def _predict_from_features(self, code, latest_data, horizon=None):
-        """从特征数据进行预测（供 predict() 和 predict_batch() 共用）
-
-        Args:
-            code: 股票代码
-            latest_data: 单行 DataFrame，包含所有特征
-            horizon: 预测周期
-
-        Returns:
-            dict: 预测结果，或 None
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        try:
-            # 处理缺失的截面特征（使用训练集统计量回退）
-            cs_feature_suffixes = ['_CS_Pct', '_CS_ZScore']
-            for suffix in cs_feature_suffixes:
-                cs_features = [col for col in self.feature_columns if col.endswith(suffix)]
-                for cs_feat in cs_features:
-                    if cs_feat not in latest_data.columns:
-                        if hasattr(self, 'cs_feature_stats') and cs_feat in self.cs_feature_stats:
-                            latest_data[cs_feat] = self.cs_feature_stats[cs_feat]['mean']
-                        else:
-                            latest_data[cs_feat] = 0.5 if suffix == '_CS_Pct' else 0.0
-
-            # 处理分类特征
-            for col, encoder in self.categorical_encoders.items():
-                if col in latest_data.columns:
-                    try:
-                        latest_data[col] = encoder.transform(latest_data[col].astype(str))
-                    except ValueError:
-                        logger.warning(f"分类特征 {col} 包含训练时未见过的类别，使用默认值")
-                        latest_data[col] = 0
-
-            X = latest_data[self.feature_columns].values
-
-            # 预测
-            proba = self.gbdt_model.predict_proba(X)[0]
-            prediction = self.gbdt_model.predict(X)[0]
-
-            return {
-                'code': code,
-                'name': STOCK_NAMES.get(code, code),
-                'prediction': int(prediction),
-                'probability': float(proba[1]),
-                'current_price': float(latest_data['Close'].values[0]),
-                'date': latest_data.index[0]
-            }
-
-        except Exception as e:
-            logger.warning(f"预测失败 {code}: {e}")
-            return None
-
-    def predict_batch(self, codes, predict_date=None, horizon=None):
-        """批量预测：先提取所有股票特征，再统一计算截面特征，最后逐只预测
-
-        核心改进：截面特征（_CS_Pct, _CS_ZScore）在所有股票数据上联合计算，
-        确保训练/预测一致，而非单只股票时退化为 0.5/0.0。
-
-        Args:
-            codes: 股票代码列表
-            predict_date: 预测日期 (YYYY-MM-DD)
-            horizon: 预测周期
-
-        Returns:
-            list: 预测结果列表
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        if len(self.feature_columns) == 0:
-            raise ValueError("模型未训练，请先调用train()方法")
-
-        logger.info(f"GBDT 开始批量预测 {len(codes)} 只股票...")
-
-        # 阶段1：逐只提取原始特征
-        all_features = {}
-        for code in codes:
-            stock_df = self._extract_raw_features_single(code, predict_date, horizon)
-            if stock_df is not None:
-                all_features[code] = stock_df
-
-        if not all_features:
-            logger.warning("GBDT 批量预测：没有成功提取任何股票的特征")
-            return []
-
-        logger.info(f"GBDT 成功提取 {len(all_features)} 只股票的特征")
-
-        # 阶段2：合并所有股票，计算截面特征
-        combined = pd.concat(all_features.values())
-
-        # 统一索引时区：将 tz-aware 时间戳转换为 tz-naive，避免 groupby 时比较错误
-        if hasattr(combined.index, 'tz') and combined.index.tz is not None:
-            combined.index = combined.index.tz_localize(None)
-        elif hasattr(combined.index, 'tz_localize'):
-            try:
-                combined.index = combined.index.tz_convert('UTC').tz_localize(None)
-            except Exception:
-                combined.index = pd.to_datetime(combined.index).tz_localize(None)
-
-        # 计算截面百分位特征
-        if self.use_cross_sectional_percentile:
-            combined = self._calculate_cross_sectional_percentile_features(combined)
-            logger.info("GBDT 批量预测：截面百分位特征计算完成")
-
-        # 计算截面 Z-Score 特征
-        if self.use_cross_sectional_zscore:
-            combined = self._calculate_cross_sectional_zscore_features(combined)
-            logger.info("GBDT 批量预测：截面 Z-Score 特征计算完成")
-
-        # 阶段3：逐只预测（使用正确的截面特征）
-        results = []
-        for code in all_features.keys():
-            stock_data = combined[combined['Code'] == code]
-            if stock_data.empty:
-                continue
-
-            latest = stock_data.iloc[-1:].copy()
-
-            # 使用辅助方法进行预测
-            result = self._predict_from_features(code, latest, horizon)
-            if result:
-                results.append(result)
-
-        logger.info(f"GBDT 批量预测完成：{len(results)}/{len(codes)} 只股票")
-        return results
 
     def save_model(self, filepath):
         """保存模型"""
@@ -4890,10 +4545,7 @@ class GBDTModel(BaseTradingModel):
             'gbdt_model': self.gbdt_model,
             'feature_columns': self.feature_columns,
             'actual_n_estimators': self.actual_n_estimators,
-            'categorical_encoders': self.categorical_encoders,
-            'use_cross_sectional_percentile': self.use_cross_sectional_percentile,
-            'use_cross_sectional_zscore': self.use_cross_sectional_zscore,
-            'cs_feature_stats': getattr(self, 'cs_feature_stats', {})
+            'categorical_encoders': self.categorical_encoders
         }
         with open(filepath, 'wb') as f:
             pickle.dump(model_data, f)
@@ -4907,15 +4559,12 @@ class GBDTModel(BaseTradingModel):
         self.feature_columns = model_data['feature_columns']
         self.actual_n_estimators = model_data['actual_n_estimators']
         self.categorical_encoders = model_data.get('categorical_encoders', {})
-        self.use_cross_sectional_percentile = model_data.get('use_cross_sectional_percentile', True)
-        self.use_cross_sectional_zscore = model_data.get('use_cross_sectional_zscore', True)
-        self.cs_feature_stats = model_data.get('cs_feature_stats', {})
         print(f"GBDT 模型已从 {filepath} 加载")
 
 
 class CatBoostModel(BaseTradingModel):
     """CatBoost 模型 - 基于 CatBoost 梯度提升算法的单一模型
-
+    
     CatBoost 是 Yandex 开发的梯度提升库，具有以下优势：
     1. 自动处理分类特征，无需手动编码
     2. 更好的默认参数，减少调参工作量
@@ -4924,225 +4573,7 @@ class CatBoostModel(BaseTradingModel):
     """
     _deprecation_warning_shown = False  # 类变量，控制弃用警告只显示一次
 
-    # 单调约束映射：特征名 → 约束方向
-    # -1: 递减约束（特征增大 → 预测概率减小）
-    # +1: 递增约束（特征增大 → 预测概率增大）
-    # 0: 无约束（逻辑不明确或依赖市场环境）
-    #
-    # 优化原则（2026-05-03 基于业界实践）：
-    # 1. 只对因果关系明确的特征使用约束
-    # 2. 波动率约束移除：相对标签模型下方向不稳定（牛市+1，熊市-1）
-    # 3. 情感约束移除：可能是反向指标（情感高 = 过度乐观）
-    # 4. 股息约束移除：港股股息溢价不明显
-    #
-    MONOTONE_CONSTRAINT_MAP = {
-        # === 相对强度特征：+1（RS↑ → 超额收益↑）===
-        # RS_Ratio = (1+股票收益)/(1+恒指收益) - 1
-        # 含义：股票相对恒指的强度，约束方向正确
-        'RS_Ratio_5d': +1,
-        'RS_Ratio_20d': +1,
-
-        # === RSI特征：-1（超买超卖）===
-        # RSI高 → 超买 → 可能下跌
-        'RSI': -1,
-
-        # === MACD特征：+1（趋势）===
-        # MACD柱正 → 上涨趋势
-        'MACD_histogram': +1,
-    }
-
-    # 市场级特征列表（2026-05-03 新增）
-    # 这些特征在同日所有股票值相同，对选股（相对标签）无区分力，反而导致模型变成宏观择时器
-    # 仅排除"裸"市场级特征，保留交叉特征（如 10d_Trend_HSI_Return_60d，分类乘数使不同股票值不同）
-    MARKET_LEVEL_FEATURES = [
-        # 恒指收益（同日所有股票值相同）
-        'HSI_Return_1d', 'HSI_Return_3d', 'HSI_Return_5d',
-        'HSI_Return_10d', 'HSI_Return_20d', 'HSI_Return_60d',
-        # HSI 市场状态
-        'HSI_Market_Regime', 'HSI_Regime_Prob_0', 'HSI_Regime_Prob_1',
-        'HSI_Regime_Prob_2', 'HSI_Regime_Duration', 'HSI_Regime_Transition_Prob',
-        # 美股
-        'SP500_Return', 'SP500_Return_5d', 'SP500_Return_20d',
-        'NASDAQ_Return', 'NASDAQ_Return_5d', 'NASDAQ_Return_20d',
-        # VIX
-        'VIX_Level', 'VIX_Change', 'VIX_Ratio_MA20',
-        # 美债
-        'US_10Y_Yield', 'US_10Y_Yield_Change',
-        'US10Y_Yield', 'US10Y_Yield_Change_5d',
-        # 市场状态 one-hot
-        'Market_Regime_Ranging', 'Market_Regime_Normal', 'Market_Regime_Trending',
-    ]
-
-    # P6: 宏交叉特征排除列表（2026-05-04 新增）
-    # 这些特征虽然在不同股票间有微小差异（通过 Trend 分类乘数），但核心信息仍是宏观环境
-    # 模型会"偷懒"用这些特征做宏观拟合，而非学习个股 Alpha
-    # 排除后强迫模型通过 Momentum/Network 特征寻找个股差异
-    MACRO_CROSS_FEATURES = [
-        # 趋势 × 恒指收益（Top 2 特征，噪音霸主）
-        '10d_Trend_HSI_Return_60d', '20d_Trend_HSI_Return_60d', '60d_Trend_HSI_Return_60d',
-        '10d_Trend_HSI_Return_20d', '20d_Trend_HSI_Return_20d', '60d_Trend_HSI_Return_20d',
-        '10d_Trend_HSI_Return_5d', '20d_Trend_HSI_Return_5d', '60d_Trend_HSI_Return_5d',
-        # 趋势 × 市场状态（Top 5 特征）
-        '10d_Trend_HSI_Regime_Prob_0', '10d_Trend_HSI_Regime_Prob_1', '10d_Trend_HSI_Regime_Prob_2',
-        '20d_Trend_HSI_Regime_Prob_0', '20d_Trend_HSI_Regime_Prob_1', '20d_Trend_HSI_Regime_Prob_2',
-        '60d_Trend_HSI_Regime_Prob_0', '60d_Trend_HSI_Regime_Prob_1', '60d_Trend_HSI_Regime_Prob_2',
-        # 趋势 × 美股
-        '10d_Trend_SP500_Return', '20d_Trend_SP500_Return', '60d_Trend_SP500_Return',
-        '10d_Trend_SP500_Return_5d', '20d_Trend_SP500_Return_5d', '60d_Trend_SP500_Return_5d',
-        '10d_Trend_NASDAQ_Return', '20d_Trend_NASDAQ_Return', '60d_Trend_NASDAQ_Return',
-        '10d_Trend_NASDAQ_Return_5d', '20d_Trend_NASDAQ_Return_5d', '60d_Trend_NASDAQ_Return_5d',
-    ]
-
-    # 滚动百分位特征列表（原始特征 → 百分位特征）
-    # 原则：波动率、成交量、ATR等绝对量级特征受益于百分位化
-    # 宏观特征（VIX, US_10Y_Yield）和已相对化特征（RS_Ratio, BB_Position, sector_rank）不转换
-    ROLLING_PERCENTILE_FEATURES = [
-        # 波动率特征
-        'Volatility_5d', 'Volatility_10d', 'Volatility_20d',
-        'Volatility_60d', 'Volatility_120d',
-        'GARCH_Conditional_Vol', 'GARCH_Vol_Ratio',
-        # ATR特征
-        'ATR', 'ATR_Ratio', 'ATR_MA60', 'ATR_MA120',
-        # 日内波动特征
-        'Intraday_Range', 'Intraday_Range_MA5', 'Intraday_Range_MA20',
-        # 成交量特征
-        'Volume_Volatility', 'Volume_Ratio_5d', 'Volume_Ratio_20d',
-    ]
-
-    # 截面百分位特征列表（P7 精简版，2026-05-04）
-    # 从 P6 的 ~100 个精简回核心高质量特征，去除高相关性冗余
-    # 原则：质量 > 数量，保留核心 Alpha 信号
-    CROSS_SECTIONAL_PERCENTILE_FEATURES = [
-        # ========== 波动率特征（保留核心，去除冗余）==========
-        'Volatility_5d', 'Volatility_20d', 'Volatility_60d',  # 短中长期
-        'GARCH_Conditional_Vol', 'Intraday_Range',  # 条件波动率、日内波幅
-        # ========== ATR特征（保留核心）==========
-        'ATR', 'ATR_Ratio', 'ATR_Risk_Score',
-        # ========== 成交量特征（保留核心）==========
-        'Volume_Ratio_5d', 'Volume_Ratio_20d', 'Volume_Volatility',
-        'OBV', 'CMF',  # 资金流向指标
-        # ========== 动量特征（保留核心，去除高相关变体）==========
-        'Momentum_20d', 'Momentum_Accel_5d', 'Momentum_Accel_20d',
-        'MACD_histogram', 'Close_Position',
-        # ========== RSI特征（保留核心）==========
-        'RSI', 'RSI_Deviation',
-        # ========== 相对强度特征（关键 Alpha 信号）==========
-        'RS_Ratio_5d', 'RS_Ratio_20d', 'RS_Diff_5d', 'RS_Diff_20d',
-        'Relative_Return',
-        # ========== 布林带/位置特征 ==========
-        'BB_Position', 'BB_Width',
-        # ========== 风险特征（保留核心）==========
-        'Max_Drawdown_20d', 'Max_Drawdown_60d',
-        'Vol_Z_Score', 'Kurtosis_20d', 'Skewness_20d',
-        # ========== 资金流向特征 ==========
-        'Smart_Money_Score', 'Accumulation_Score',
-        # ========== 基本面特征 ==========
-        'PE', 'PB', 'ROE', 'Market_Cap',
-        # ========== 异常检测特征（关键 Alpha 信号）==========
-        'Anomaly_Severity_Score', 'Anomaly_Buy_Signal',
-        # ========== 网络增量特征（P7 新增）==========
-        'net_node_deviation', 'net_node_deviation_delta_5d',
-    ]
-
-    # 截面 Z-Score 特征列表（P7 精简版，2026-05-04）
-    # 对关键特征进行截面标准化，确保特征在截面内可比
-    CROSS_SECTIONAL_ZSCORE_FEATURES = [
-        # 成交量特征（时间序列 Z-Score 基准问题最严重）
-        'Volume', 'Turnover', 'Turnover_Mean_20',
-        # 波动率特征
-        'Volatility_5d', 'Volatility_20d', 'Volatility_60d',
-        'GARCH_Conditional_Vol',
-        # ATR特征
-        'ATR', 'ATR_Ratio',
-        # 成交量比率特征
-        'Volume_Ratio_5d', 'Volume_Ratio_20d',
-        'OBV', 'CMF',
-        # 动量特征
-        'Momentum_20d', 'Momentum_Accel_5d', 'Momentum_Accel_20d',
-        'MACD_histogram',
-        # RSI特征
-        'RSI', 'RSI_Deviation',
-        # 相对强度特征
-        'RS_Ratio_5d', 'RS_Ratio_20d', 'RS_Diff_5d', 'RS_Diff_20d',
-        'Relative_Return',
-        # 布林带/位置特征
-        'BB_Position', 'BB_Width',
-        # 风险特征
-        'Max_Drawdown_20d', 'Max_Drawdown_60d',
-        'Vol_Z_Score', 'Kurtosis_20d', 'Skewness_20d',
-        # 资金流向特征
-        'Smart_Money_Score', 'Accumulation_Score',
-        # 基本面特征
-        'PE', 'PB', 'ROE', 'Market_Cap',
-        # 网络增量特征（P7 新增）
-        'net_node_deviation', 'net_node_deviation_delta_5d',
-    ]
-
-    # ========== P9 阶段：特征分层策略 ==========
-    # L1 核心截面特征：选股核心信号，与相对标签逻辑一致
-    L1_CORE_CS_FEATURES = [
-        # ========== 资金流向（选股核心）==========
-        'CMF_CS_Pct', 'CMF_CS_ZScore',
-        'OBV_CS_Pct', 'OBV_CS_ZScore',
-        'Smart_Money_Score_CS_Pct', 'Smart_Money_Score_CS_ZScore',
-        'Accumulation_Score_CS_Pct', 'Accumulation_Score_CS_ZScore',
-        # ========== 动量（选股核心）==========
-        'Momentum_20d_CS_Pct', 'Momentum_20d_CS_ZScore',
-        'Momentum_Accel_5d_CS_Pct', 'Momentum_Accel_5d_CS_ZScore',
-        'MACD_histogram_CS_Pct', 'MACD_histogram_CS_ZScore',
-        # ========== 相对强度（关键 Alpha）==========
-        'RS_Ratio_5d_CS_Pct', 'RS_Ratio_5d_CS_ZScore',
-        'RS_Ratio_20d_CS_Pct', 'RS_Ratio_20d_CS_ZScore',
-        'RS_Diff_5d_CS_Pct', 'RS_Diff_5d_CS_ZScore',
-        'RS_Diff_20d_CS_Pct', 'RS_Diff_20d_CS_ZScore',
-        'Relative_Return_CS_Pct', 'Relative_Return_CS_ZScore',
-        # ========== 波动率（风险调整）==========
-        'Volatility_20d_CS_Pct', 'Volatility_20d_CS_ZScore',
-        'ATR_Ratio_CS_Pct', 'ATR_Ratio_CS_ZScore',
-        # ========== 风险特征 ==========
-        'Max_Drawdown_20d_CS_Pct', 'Max_Drawdown_20d_CS_ZScore',
-        'Kurtosis_20d_CS_Pct', 'Kurtosis_20d_CS_ZScore',
-        'Skewness_20d_CS_Pct', 'Skewness_20d_CS_ZScore',
-        # ========== 基本面 ==========
-        'PE_CS_Pct', 'PE_CS_ZScore',
-        'PB_CS_Pct', 'PB_CS_ZScore',
-        'ROE_CS_Pct', 'ROE_CS_ZScore',
-    ]
-
-    # L3 剔除特征：市场级 + 宏观交叉特征（干扰选股）
-    L3_EXCLUDE_FEATURES = [
-        # ========== 纯市场特征（同日所有股票值相同）==========
-        'US_10Y_Yield', 'US_10Y_Yield_Change',
-        'US10Y_Yield', 'US10Y_Yield_Change_5d',
-        'VIX_Level', 'VIX_Change', 'VIX_Ratio_MA20',
-        'HSI_Return_1d', 'HSI_Return_3d', 'HSI_Return_5d',
-        'HSI_Return_10d', 'HSI_Return_20d', 'HSI_Return_60d',
-        'SP500_Return', 'SP500_Return_5d', 'SP500_Return_20d',
-        'NASDAQ_Return', 'NASDAQ_Return_5d', 'NASDAQ_Return_20d',
-        'HSI_Market_Regime', 'HSI_Regime_Prob_0', 'HSI_Regime_Prob_1',
-        'HSI_Regime_Prob_2', 'HSI_Regime_Duration', 'HSI_Regime_Transition_Prob',
-        'Market_Regime_Ranging', 'Market_Regime_Normal', 'Market_Regime_Trending',
-        # ========== 宏观交叉特征（含市场成分）==========
-        # Trend × 市场收益
-        '5d_Trend_HSI_Return_5d', '10d_Trend_HSI_Return_10d',
-        '20d_Trend_HSI_Return_20d', '60d_Trend_HSI_Return_60d',
-        # Trend × 市场状态
-        '5d_Trend_HSI_Regime_Prob_0', '5d_Trend_HSI_Regime_Prob_1',
-        '10d_Trend_HSI_Regime_Prob_0', '10d_Trend_HSI_Regime_Prob_1',
-        '20d_Trend_HSI_Regime_Prob_0', '20d_Trend_HSI_Regime_Prob_1',
-        # Trend × 美股
-        '5d_Trend_SP500_Return_5d', '10d_Trend_SP500_Return_10d',
-        '20d_Trend_SP500_Return_20d',
-        '5d_Trend_NASDAQ_Return_5d', '10d_Trend_NASDAQ_Return_10d',
-        '20d_Trend_NASDAQ_Return_20d',
-    ]
-
-    def __init__(self, class_weight='balanced', use_dynamic_threshold=False,
-                 use_monotone_constraints=True, time_decay_lambda=0.5,
-                 use_rolling_percentile=False,  # 2026-05-02: 关闭滚动百分位（消融实验证明其降低IC）
-                 use_cross_sectional_percentile=True,  # 2026-05-03: 截面百分位（与相对标签匹配）
-                 use_cross_sectional_zscore=True,  # 2026-05-03: 截面 Z-Score（解决时间序列基准问题）
-                 feature_importance_threshold=0.0):  # P3-8: 特征修剪阈值（0=不修剪）
+    def __init__(self, class_weight='balanced', use_dynamic_threshold=False, fp_penalty=None):
         """初始化 CatBoost 模型
 
         Args:
@@ -5152,239 +4583,26 @@ class CatBoostModel(BaseTradingModel):
                 - None: 不使用类别权重
                 - dict: 手动指定权重，如 {0: 1.0, 1: 1.2}
             use_dynamic_threshold: 是否使用动态阈值策略
-            use_monotone_constraints: 是否使用单调约束（防止特征方向翻转，推荐开启）
-            time_decay_lambda: 时间衰减系数（0=无衰减，0.5=默认，1.0=强衰减）
-            use_rolling_percentile: 是否使用滚动百分位特征（已关闭，消融实验证明降低IC）
-            use_cross_sectional_percentile: 是否使用截面百分位特征（与相对标签匹配）
-            use_cross_sectional_zscore: 是否使用截面 Z-Score 特征（解决时间序列基准问题）
-            feature_importance_threshold: 特征重要性阈值，低于此值的特征将被移除（0=不修剪）
+            fp_penalty: False Positive 惩罚系数（非对称损失函数）
+                - None: 不使用额外惩罚
+                - float (如 2.5): 对类别0（下跌）施加 fp_penalty 倍惩罚
+                - 效果：class_weights = {0: fp_penalty, 1: 1.0}，惩罚预测涨但实际跌的错误
         """
         super().__init__()  # 调用基类初始化
         self.catboost_model = None
         self.actual_n_estimators = 0
         self.model_type = 'catboost'  # 模型类型标识
-        self.class_weight = class_weight
         self.use_dynamic_threshold = use_dynamic_threshold
-        self.use_monotone_constraints = use_monotone_constraints
-        self.time_decay_lambda = time_decay_lambda
-        self.use_rolling_percentile = use_rolling_percentile
-        self.use_cross_sectional_percentile = use_cross_sectional_percentile
-        self.use_cross_sectional_zscore = use_cross_sectional_zscore
-        self.feature_importance_threshold = feature_importance_threshold  # P3-8
-        self.monotone_constraints_list = None  # 训练时填充
-        self.sample_weights = None  # 时间衰减权重
+        self.fp_penalty = fp_penalty
 
-        logger.info(f"CatBoostModel 初始化: class_weight={class_weight}, "
-                    f"use_monotone_constraints={use_monotone_constraints}, "
-                    f"time_decay_lambda={time_decay_lambda}, "
-                    f"use_rolling_percentile={use_rolling_percentile}, "
-                    f"use_cross_sectional_percentile={use_cross_sectional_percentile}, "
-                    f"use_cross_sectional_zscore={use_cross_sectional_zscore}, "
-                    f"feature_importance_threshold={feature_importance_threshold}")
+        # 如果设置了 fp_penalty，覆盖 class_weight（非对称损失函数）
+        if fp_penalty is not None:
+            self.class_weight = {0: fp_penalty, 1: 1.0}
+            logger.info(f"CatBoostModel 使用非对称损失函数: FP惩罚={fp_penalty}x")
+        else:
+            self.class_weight = class_weight
 
-    def _build_monotone_constraints(self, feature_columns):
-        """根据特征名称构建单调约束列表
-
-        Args:
-            feature_columns: 特征列名列表（动态生成）
-
-        Returns:
-            list: 单调约束列表（-1/0/+1），与 feature_columns 一一对应
-        """
-        if not self.use_monotone_constraints:
-            return None
-
-        constraints = []
-        matched = 0
-        for col in feature_columns:
-            # 精确匹配
-            if col in self.MONOTONE_CONSTRAINT_MAP:
-                constraints.append(self.MONOTONE_CONSTRAINT_MAP[col])
-                matched += 1
-            else:
-                constraints.append(0)  # 未匹配的默认无约束
-
-        logger.info(f"单调约束：{matched}/{len(feature_columns)} 个特征被约束 "
-                    f"(+1={constraints.count(1)}, -1={constraints.count(-1)}, "
-                    f"0={constraints.count(0)})")
-
-        self.monotone_constraints_list = constraints
-        return constraints
-
-    def _compute_time_decay_weights(self, df, lambda_decay=0.5):
-        """计算时间衰减样本权重
-
-        公式: W_i = exp(-lambda * delta_t_years)
-        其中 delta_t_years = (最新日期 - 当前样本日期) / 252
-
-        Args:
-            df: 包含时间索引的 DataFrame
-            lambda_decay: 衰减系数（0=无衰减，0.5=温和衰减，1.0=强衰减）
-
-        Returns:
-            numpy.ndarray: 样本权重数组（归一化至均值=1）
-        """
-        if lambda_decay <= 0 or df.empty:
-            return None
-
-        # 获取日期索引
-        dates = df.index
-        if not isinstance(dates, pd.DatetimeIndex):
-            dates = pd.to_datetime(dates)
-
-        # 计算距最新日期的年数
-        max_date = dates.max()
-        delta_days = (max_date - dates).total_seconds() / (24 * 3600)
-        # 转换为 numpy 数组，避免 Index 对象的问题
-        delta_days = np.array(delta_days)
-        delta_years = delta_days / 252.0  # 交易日年化
-
-        # 指数衰减
-        weights = np.exp(-lambda_decay * delta_years)
-
-        # 归一化至均值=1（保持与无权重时的期望损失等价）
-        weights = weights / np.mean(weights)
-
-        # 日志输出
-        oldest_weight = weights.min()
-        newest_weight = weights.max()
-        logger.info(f"时间衰减权重: lambda={lambda_decay}, "
-                    f"最旧样本权重={oldest_weight:.3f}, 最新样本权重={newest_weight:.3f}, "
-                    f"比值={newest_weight/max(oldest_weight, 1e-10):.2f}x")
-
-        return weights
-
-    def _calculate_rolling_percentile_features(self, df, window=252):
-        """计算滚动百分位特征（时间序列自归一化）
-
-        将绝对量级特征转换为历史百分位，使特征在regime变化时保持稳定。
-        公式: feature_pct = feature.rolling(window).rank(pct=True)
-
-        Args:
-            df: 股票数据 DataFrame
-            window: 滚动窗口（默认252个交易日=1年）
-
-        Returns:
-            DataFrame: 包含百分位特征的 DataFrame（原始特征被替换）
-        """
-        if not self.use_rolling_percentile:
-            return df
-
-        features_to_convert = self.ROLLING_PERCENTILE_FEATURES
-        converted = 0
-
-        for feat in features_to_convert:
-            if feat not in df.columns:
-                continue
-
-            # 滚动百分位：当前值在过去window天中的排名百分位
-            # 使用 rank(pct=True) 返回 0-1 之间的值
-            pct_values = df[feat].rolling(window, min_periods=20).rank(pct=True)
-
-            # 填充开头NaN为0.5（中位数，保守假设）
-            pct_values = pct_values.fillna(0.5)
-
-            # 直接替换原始特征
-            df[feat] = pct_values
-            converted += 1
-
-        if converted > 0:
-            logger.info(f"滚动百分位特征：转换了 {converted} 个特征（窗口={window}天）")
-
-        return df
-
-    def _calculate_cross_sectional_percentile_features(self, df):
-        """计算截面百分位特征（2026-05-03 新增）
-
-        核心思想：
-        - 每天对所有股票进行排名，计算当日排名百分位
-        - 与相对标签逻辑一致：判断"这只股票今天在所有股票中排第几"
-        - 适用场景：截面选股（与相对标签匹配）
-
-        对比滚动百分位：
-        - 滚动百分位：df[feat].rolling(252).rank(pct=True) — 比较历史值
-        - 截面百分位：df.groupby('Date')[feat].rank(pct=True) — 比较当日其他股票
-
-        Args:
-            df: 数据 DataFrame，索引为日期，包含 'Code' 列
-
-        Returns:
-            DataFrame: 包含新增的截面百分位特征（_CS_Pct 后缀）
-        """
-        if not self.use_cross_sectional_percentile:
-            return df
-
-        features_to_convert = self.CROSS_SECTIONAL_PERCENTILE_FEATURES
-        converted = 0
-
-        for feat in features_to_convert:
-            if feat not in df.columns:
-                continue
-
-            # 截面百分位：按日期分组，计算当日排名百分位
-            # 结果范围：0-1，0.5 表示当日中位数
-            cs_pct = df.groupby(df.index)[feat].rank(pct=True)
-
-            # 新增特征列（不替换原始特征）
-            df[f'{feat}_CS_Pct'] = cs_pct
-            converted += 1
-
-        if converted > 0:
-            logger.info(f"截面百分位特征：新增 {converted} 个特征（_CS_Pct 后缀）")
-
-        return df
-
-    def _calculate_cross_sectional_zscore_features(self, df):
-        """计算截面 Z-Score 特征（2026-05-03 新增）
-
-        核心思想：
-        - 每天对所有股票进行 Z-Score 标准化
-        - 确保特征在截面内可比，避免时间序列标准化的基准问题
-        - 与相对标签逻辑一致：在当天所有股票范围内比较
-
-        为什么需要截面 Z-Score：
-        - 时间序列 Z-Score 使用该股票历史均值/标准差，不同股票基准不同
-        - 港股存在均值回归，时间序列标准化会认错高低位
-        - 截面 Z-Score 确保模型学习的是"这只票今天比别的票强/弱多少个标准差"
-
-        公式：
-        Z_i = (X_i - mean(X_day)) / std(X_day)
-
-        Args:
-            df: 数据 DataFrame，索引为日期，包含 'Code' 列
-
-        Returns:
-            DataFrame: 包含新增的截面 Z-Score 特征（_CS_ZScore 后缀）
-        """
-        if not self.use_cross_sectional_zscore:
-            return df
-
-        features_to_convert = self.CROSS_SECTIONAL_ZSCORE_FEATURES
-        converted = 0
-
-        for feat in features_to_convert:
-            if feat not in df.columns:
-                continue
-
-            # 截面 Z-Score：按日期分组，计算当天所有股票的 Z-Score
-            # 结果范围：约 -3 到 +3，0 表示当天中位数
-            def zscore_safe(x):
-                std = x.std()
-                if std > 1e-10:
-                    return (x - x.mean()) / std
-                else:
-                    return 0.0  # 常量特征返回 0
-
-            cs_zscore = df.groupby(df.index)[feat].transform(zscore_safe)
-
-            # 新增特征列（不替换原始特征）
-            df[f'{feat}_CS_ZScore'] = cs_zscore
-            converted += 1
-
-        if converted > 0:
-            logger.info(f"截面 Z-Score 特征：新增 {converted} 个特征（_CS_ZScore 后缀）")
-
-        return df
+        logger.info(f"CatBoostModel 初始化: class_weight={self.class_weight}, use_dynamic_threshold={use_dynamic_threshold}, fp_penalty={fp_penalty}")
 
     def load_selected_features(self, filepath=None, current_feature_names=None):
         """加载选择的特征列表（使用特征名称交集，确保特征存在）
@@ -5464,7 +4682,7 @@ class CatBoostModel(BaseTradingModel):
             logger.warning(f"加载特征列表失败: {e}")
             return None
 
-    def prepare_data(self, codes, start_date=None, end_date=None, horizon=1, for_backtest=False, min_return_threshold=0.0, use_feature_cache=True, label_type='relative'):
+    def prepare_data(self, codes, start_date=None, end_date=None, horizon=1, for_backtest=False, min_return_threshold=0.0, use_feature_cache=True, community_ids=None):
         """准备训练数据
 
         Args:
@@ -5475,11 +4693,10 @@ class CatBoostModel(BaseTradingModel):
             for_backtest: 是否为回测准备数据（True时不应用horizon过滤）
             min_return_threshold: 最小收益阈值（默认0%），用于标签定义
             use_feature_cache: 是否使用特征缓存（默认True）
-            label_type: 标签类型（'absolute'=绝对标签，'relative'=相对标签，默认'relative'）
+            community_ids: 预定义的社区 ID 列表（用于测试数据，确保与训练一致）
         """
         self.horizon = horizon
         self.min_return_threshold = min_return_threshold
-        self.label_type = label_type
         all_data = []
 
         # 获取美股市场数据（只获取一次）
@@ -5511,15 +4728,18 @@ class CatBoostModel(BaseTradingModel):
                 print(f"  ⚠️ HSI 市场状态特征计算失败: {e}")
 
         # 加载网络特征（跨截面特征，所有股票共享）
-        # 已移除：网络特征存在数据泄漏风险，作为独立分析工具使用
-        # network_loader = NetworkFeatureLoader()
-        # network_available = network_loader.is_available()
-        # if network_available:
-        #     network_loader.load_features()
-        #     print("  ✅ 网络特征加载完成")
-        # else:
-        #     print("  ⚠️ 网络特征文件不可用，将使用默认值")
-        network_available = False  # 禁用网络特征
+        # 网络特征文件由 stock_network_analysis.py 生成
+        network_features_file = 'output/network_features_for_ml.json'
+        network_features_data = None
+        try:
+            if os.path.exists(network_features_file):
+                with open(network_features_file, 'r') as f:
+                    network_features_data = json.load(f)
+                print(f"  ✅ 网络特征加载完成（{len(network_features_data)} 只股票）")
+            else:
+                print("  ⚠️ 网络特征文件不存在，将跳过网络特征")
+        except Exception as e:
+            print(f"  ⚠️ 网络特征加载失败: {e}")
 
         cache_hits = 0
         cache_misses = 0
@@ -5618,8 +4838,6 @@ class CatBoostModel(BaseTradingModel):
                     for key, value in sector_features.items():
                         stock_df[key] = value
 
-                    # 网络特征已移除：存在数据泄漏风险，作为独立分析工具使用
-
                     # 添加事件驱动特征（9个）
                     stock_df = self.feature_engineer.create_event_driven_features(code, stock_df)
 
@@ -5629,16 +4847,54 @@ class CatBoostModel(BaseTradingModel):
                     # 生成交叉特征（与训练时保持一致）
                     stock_df = self.feature_engineer.create_interaction_features(stock_df)
 
-                    # 保存特征缓存（不含标签）
-                    if use_feature_cache:
-                        _save_feature_cache(cache_file_path, {'stock_df': stock_df})
+                # ========== 网络特征和交叉特征（无论缓存是否命中都需要更新）==========
+                # 原因：网络特征文件可能已更新，导致社区 ID 列表变化
+                # 必须使用预加载的 community_ids 确保训练/预测一致性
+
+                # 添加网络特征（从预计算文件加载）
+                if network_features_data is not None and code in network_features_data:
+                    net_features = network_features_data[code]
+                    for key, value in net_features.items():
+                        stock_df[key] = value
+                else:
+                    # 为缺失网络特征的股票提供默认值
+                    default_net_features = {
+                        'net_degree_centrality': 0.0,
+                        'net_betweenness_centrality': 0.0,
+                        'net_eigenvector_centrality': 0.0,
+                        'net_closeness_centrality': 0.0,
+                        'net_composite_centrality': 0.0,
+                        'net_community_id': -1,  # -1 表示未知社区
+                        'net_community_size': 0,
+                        'net_community_centrality_rank': -1,  # -1表示未知社区
+                        'net_sector_cohesion': 0.0,
+                        'net_mst_degree': 0,
+                        'net_mst_neighbor_sectors': 0,
+                        'net_inter_community_ratio': 0.0,
+                        # 结构洞特征默认值
+                        'net_constraint': 1.0,  # 高约束=无机会
+                        'net_effective_size': 0.0,
+                        'net_local_clustering': 0.0,
+                    }
+                    for key, value in default_net_features.items():
+                        stock_df[key] = value
+                    logger.debug(f"股票 {code} 使用默认网络特征（社区 ID = -1）")
+
+                # 生成市场-网络交叉特征（使用预加载的 community_ids）
+                stock_df = self.feature_engineer.create_market_network_interaction_features(
+                    stock_df, community_ids=community_ids)
+
+                # 保存/更新特征缓存（包含最新的网络交叉特征）
+                if use_feature_cache:
+                    _save_feature_cache(cache_file_path, {'stock_df': stock_df})
+                    if use_cache:
+                        print(f"  💾 缓存已更新（网络交叉特征）")
+                    else:
                         print(f"  💾 特征已缓存")
-                        logger.debug(f"特征缓存已保存: {cache_key}")
+                    logger.debug(f"特征缓存已保存: {cache_key}")
 
                 # 创建标签（使用指定的 horizon 和阈值，不缓存）
-                # 注意：相对标签需要在所有股票数据收集完成后统一计算
-                if label_type == 'absolute':
-                    stock_df = self.feature_engineer.create_label(stock_df, horizon=horizon, for_backtest=for_backtest, min_return_threshold=min_return_threshold, label_type='absolute')
+                stock_df = self.feature_engineer.create_label(stock_df, horizon=horizon, for_backtest=for_backtest, min_return_threshold=min_return_threshold)
 
                 # 添加股票代码
                 stock_df['Code'] = code
@@ -5664,115 +4920,6 @@ class CatBoostModel(BaseTradingModel):
         # 转换索引为 datetime（统一为UTC时区）
         df.index = pd.to_datetime(df.index, utc=True)
 
-        # ========== 网络特征（跨截面特征，所有股票共享）==========
-        # 使用实时计算，确保数据泄漏防护（for_prediction=True 排除当日数据）
-        # P7 优化（2026-05-04）：添加增量网络特征
-        try:
-            from data_services.network_features import get_network_calculator
-            import networkx as nx
-
-            print("  📊 计算网络特征...")
-            network_calc = get_network_calculator()
-
-            # 获取所有股票代码
-            unique_codes = df['Code'].unique().tolist()
-
-            # 计算网络洞察（中心性、社区等）
-            insights = network_calc.calculate_network_insights(unique_codes, force_refresh=True)
-
-            # 计算节点偏离度（当前窗口）
-            deviations = network_calc.calculate_node_deviation(unique_codes, score_type='momentum', window=20)
-
-            # P7 新增：计算不同窗口的节点偏离度，用于增量特征
-            deviations_5d = network_calc.calculate_node_deviation(unique_codes, score_type='momentum', window=5)
-
-            # 将网络特征添加到每只股票的数据中
-            network_feature_names = [
-                'net_composite_centrality',
-                'net_community_id',
-                'net_node_deviation',
-                # P7 新增：增量网络特征
-                'net_node_deviation_delta_5d',  # 节点偏离度变化率
-                'net_node_deviation_accel',     # 节点偏离度加速度
-            ]
-
-            # 初始化网络特征列
-            for feat in network_feature_names:
-                df[feat] = 0.0 if feat != 'net_community_id' else -1
-
-            # 填充网络特征
-            for code in unique_codes:
-                mask = df['Code'] == code
-
-                # 中心性
-                if code in insights:
-                    df.loc[mask, 'net_composite_centrality'] = insights[code].get('composite_centrality', 0)
-
-                # 社区ID（分类特征）
-                if code in insights:
-                    df.loc[mask, 'net_community_id'] = insights[code].get('community', -1)
-
-                # 节点偏离度
-                dev_20d = deviations.get(code, {}).get('node_deviation', 0) if code in deviations else 0
-                dev_5d = deviations_5d.get(code, {}).get('node_deviation', 0) if code in deviations_5d else 0
-
-                df.loc[mask, 'net_node_deviation'] = dev_20d
-
-                # P7 新增：增量特征
-                # 节点偏离度变化率 = 当前偏离度 - 5日前偏离度
-                # 正值表示"正在变得更强"，负值表示"正在变弱"
-                df.loc[mask, 'net_node_deviation_delta_5d'] = dev_20d - dev_5d
-
-                # 节点偏离度加速度 = 变化率的变化率
-                # 正值表示"加速变强"，负值表示"减速变强"
-                # 这里用 20d 偏离度与 5d 偏离度的差值作为加速度的代理
-                df.loc[mask, 'net_node_deviation_accel'] = (dev_20d - dev_5d) / (abs(dev_5d) + 0.001)  # 归一化
-
-            print(f"  ✅ 网络特征计算完成（5个特征，含增量特征）")
-            logger.info(f"网络特征计算完成: {len(unique_codes)} 只股票")
-
-        except Exception as e:
-            logger.warning(f"网络特征计算失败: {e}，将使用默认值")
-            print(f"  ⚠️ 网络特征计算失败: {e}")
-            # 使用默认值
-            network_feature_names = [
-                'net_composite_centrality',
-                'net_community_id',
-                'net_node_deviation',
-                'net_node_deviation_delta_5d',
-                'net_node_deviation_accel',
-            ]
-            for feat in network_feature_names:
-                if feat not in df.columns:
-                    df[feat] = 0.0 if feat != 'net_community_id' else -1
-
-        # 相对标签：在合并所有股票数据后统一计算
-        if label_type == 'relative':
-            print(f"  计算相对标签（每日中位数）...")
-            # 保存原始索引（日期）
-            original_dates = df.index.copy()
-
-            # 计算未来收益率（在原 DataFrame 上操作，保持日期索引）
-            df['Future_Return'] = df.groupby('Code')['Close'].transform(
-                lambda x: x.shift(-horizon) / x - 1
-            )
-
-            # 按日期计算每日中位数（使用日期索引）
-            daily_median = df.groupby(df.index)['Future_Return'].median()
-            daily_median.name = 'Daily_Median_Return'
-
-            # 将中位数映射回原数据
-            df['Daily_Median_Return'] = df.index.map(daily_median)
-
-            # 创建相对标签
-            df['Label'] = (df['Future_Return'] > df['Daily_Median_Return']).astype(int)
-
-            # 如果不是回测模式，移除最后horizon行（没有标签的数据）
-            if not for_backtest:
-                df = df.iloc[:-horizon]
-
-            print(f"  相对标签正例比例: {df['Label'].mean():.2%}")
-
         # 过滤日期范围（如果指定）
         if start_date:
             start_date = pd.to_datetime(start_date, utc=True)
@@ -5780,45 +4927,6 @@ class CatBoostModel(BaseTradingModel):
         if end_date:
             end_date = pd.to_datetime(end_date, utc=True)
             df = df[df.index <= end_date]
-
-        # ========== 特征残差化（剔除宏观因子对微观特征的影响）==========
-        # 对微观特征剔除宏观因子贡献，迫使模型学习个股特异性
-        try:
-            from data_services.feature_residualizer import FeatureResidualizer
-            residualizer = FeatureResidualizer()
-            df = residualizer.residualize(df, inplace=True, keep_original=False)
-            # 保存残差化器到实例，用于预测时保持一致
-            self.residualizer = residualizer
-            residual_features = residualizer.get_residual_features()
-            if residual_features:
-                logger.info(f"特征残差化完成，生成 {len(residual_features)} 个残差特征")
-        except Exception as e:
-            logger.warning(f"特征残差化失败: {e}，将使用原始特征")
-            self.residualizer = None
-
-        # ========== 滚动百分位特征（已关闭，消融实验证明其降低IC）==========
-        if self.use_rolling_percentile:
-            df = self._calculate_rolling_percentile_features(df)
-
-        # ========== 截面百分位特征（2026-05-03 新增，与相对标签匹配）==========
-        if self.use_cross_sectional_percentile:
-            df = self._calculate_cross_sectional_percentile_features(df)
-
-        # ========== 截面 Z-Score 特征（2026-05-03 新增，解决时间序列基准问题）==========
-        if self.use_cross_sectional_zscore:
-            df = self._calculate_cross_sectional_zscore_features(df)
-
-        # 保存截面特征的训练集统计量，供单只股票预测时回退使用
-        # 当单只股票预测无法计算截面特征时，使用训练集均值作为中性值
-        self.cs_feature_stats = {}
-        for col in df.columns:
-            if col.endswith('_CS_Pct') or col.endswith('_CS_ZScore'):
-                self.cs_feature_stats[col] = {
-                    'mean': float(df[col].mean()),
-                    'std': float(df[col].std()),
-                }
-        if self.cs_feature_stats:
-            logger.info(f"保存 {len(self.cs_feature_stats)} 个截面特征的统计量（供单股预测回退）")
 
         logger.info(f"数据准备完成，共 {len(df)} 条记录")
 
@@ -5835,48 +4943,25 @@ class CatBoostModel(BaseTradingModel):
         Returns:
             list: 特征列名列表
         """
-        # 排除非特征列（包括中间计算列）
-        exclude_columns = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
-                          'Future_Return', 'Label', 'Prev_Close', 'Label_Threshold',
-                          'Daily_Median_Return',  # 相对标签计算的中间结果，预测时无法获得
-                          'Vol_MA20', 'MA5', 'MA10', 'MA20', 'MA50', 'MA100', 'MA200',
-                          'BB_upper', 'BB_lower', 'BB_middle',
-                          'Low_Min', 'High_Max', '+DM', '-DM', '+DI', '-DI',
-                          'TP', 'MF_Multiplier', 'MF_Volume',
-                          # 已删除的冗余特征（保留 DataFrame 列用于中间计算）
-                          'Returns', 'Volatility', 'MA5_Deviation', 'MA10_Deviation',
-                          'BB_Breakout', 'High_Position_20d', 'MA_Bullish_Resonance',
-                          'Momentum_5d', 'Momentum_10d', 'Momentum_120d', 'Momentum_250d',
-                          'Consecutive_Ranging_Days', 'Confidence_Threshold_Multiplier',
-                          'Price_Return_Std_30d']
+        # 基础排除列 + 中间计算列
+        base_exclude = ['Code', 'Open', 'High', 'Low', 'Close', 'Volume',
+                       'Future_Return', 'Label', 'Prev_Close', 'Label_Threshold',
+                       'Vol_MA20', '+DM', '-DM', '+DI', '-DI']
+        # 已删除的冗余特征（保留 DataFrame 列用于中间计算）
+        deprecated_features = ['Returns', 'Volatility', 'MA5_Deviation', 'MA10_Deviation',
+                              'BB_Breakout', 'High_Position_20d', 'MA_Bullish_Resonance',
+                              'Momentum_5d', 'Momentum_10d', 'Momentum_120d', 'Momentum_250d',
+                              'Consecutive_Ranging_Days', 'Confidence_Threshold_Multiplier',
+                              'Price_Return_Std_30d']
+        exclude_columns = base_exclude + ABSOLUTE_PRICE_FEATURES + deprecated_features
 
-        # 排除市场级特征（对选股无区分力，防止模型变成宏观择时器）
-        # 注意：市场级特征保留在 DataFrame 中（残差化需要用），只是不进入模型特征列表
-        market_exclude = set(self.MARKET_LEVEL_FEATURES) if hasattr(self, 'MARKET_LEVEL_FEATURES') else set()
-        feature_columns = [col for col in df.columns if col not in exclude_columns and col not in market_exclude]
+        # 排除纯市场级特征（所有股票同值，无法区分个股）
+        # 这些特征已通过与网络社区特征交叉保留信息
+        market_exclude = set(MARKET_LEVEL_FEATURES)
 
-        # 日志记录排除的市场级特征
-        excluded_market_features = [col for col in df.columns if col in market_exclude]
-        if excluded_market_features:
-            logger.info(f"排除 {len(excluded_market_features)} 个市场级特征: {excluded_market_features[:5]}{'...' if len(excluded_market_features) > 5 else ''}")
-
-        # P6: 排除宏交叉特征（趋势 × 宏观变量，模型会"偷懒"用这些做宏观拟合）
-        macro_cross_exclude = set(self.MACRO_CROSS_FEATURES) if hasattr(self, 'MACRO_CROSS_FEATURES') else set()
-        feature_columns = [col for col in feature_columns if col not in macro_cross_exclude]
-
-        # 日志记录排除的宏交叉特征
-        excluded_macro_cross = [col for col in df.columns if col in macro_cross_exclude]
-        if excluded_macro_cross:
-            logger.info(f"排除 {len(excluded_macro_cross)} 个宏交叉特征: {excluded_macro_cross[:5]}{'...' if len(excluded_macro_cross) > 5 else ''}")
-
-        # P9: 排除 L3 特征（市场级 + 宏观交叉特征的完整列表）
-        l3_exclude = set(self.L3_EXCLUDE_FEATURES) if hasattr(self, 'L3_EXCLUDE_FEATURES') else set()
-        feature_columns = [col for col in feature_columns if col not in l3_exclude]
-
-        # 日志记录排除的 L3 特征
-        excluded_l3 = [col for col in df.columns if col in l3_exclude]
-        if excluded_l3:
-            logger.info(f"P9 排除 {len(excluded_l3)} 个 L3 特征: {excluded_l3[:5]}{'...' if len(excluded_l3) > 5 else ''}")
+        feature_columns = [col for col in df.columns
+                          if col not in exclude_columns
+                          and col not in market_exclude]
 
         # 可选：Pearson 去冗余（防止新增特征时引入高相关冗余）
         if dedup_threshold and len(feature_columns) > 0:
@@ -5908,7 +4993,7 @@ class CatBoostModel(BaseTradingModel):
             start_date: 训练开始日期
             end_date: 训练结束日期
             horizon: 预测周期（1=次日，5=一周，20=一个月）
-            use_feature_selection: 是否使用特征选择（已弃用，默认False使用全量特征）
+            use_feature_selection: 是否使用特征选择
             min_return_threshold: 最小收益阈值（默认0%），用于标签定义
         # 设置固定随机种子（确保模型训练的可重现性）
         np.random.seed(42)
@@ -5917,9 +5002,9 @@ class CatBoostModel(BaseTradingModel):
         Returns:
             DataFrame: 特征重要性数据
         """
-        # 检查是否需要显示弃用警告
+        # 检查是否需要显示特征选择提示
         if use_feature_selection and not CatBoostModel._deprecation_warning_shown:
-            print("⚠️  警告：特征选择功能已弃用，建议使用全量特征（892个）。Walk-forward验证显示全量特征性能更好。")
+            print("💡 提示：使用特征选择，Walk-forward 验证显示夏普比率更优")
             CatBoostModel._deprecation_warning_shown = True
 
         print("\n" + "="*70)
@@ -5930,23 +5015,55 @@ class CatBoostModel(BaseTradingModel):
         print(f"特征选择: {'是' if use_feature_selection else '否'}")
         print(f"最小收益阈值: {min_return_threshold:.2%}")
 
+        # ========== 预加载网络特征以获取社区 ID ==========
+        # 在准备数据之前，先加载网络特征文件提取社区 ID 列表
+        # 这样可以确保训练时使用正确的社区 ID，避免动态提取导致的不一致
+        network_features_file = 'output/network_features_for_ml.json'
+        preloaded_community_ids = None
+        if os.path.exists(network_features_file):
+            try:
+                with open(network_features_file, 'r') as f:
+                    network_features_data = json.load(f)
+                # 从所有股票的网络特征中提取唯一的社区 ID
+                all_community_ids = set()
+                for stock_code, net_features in network_features_data.items():
+                    if 'net_community_id' in net_features:
+                        comm_id = net_features['net_community_id']
+                        if comm_id >= 0:  # 只保留有效社区 ID
+                            all_community_ids.add(int(comm_id))
+                if all_community_ids:
+                    preloaded_community_ids = sorted(list(all_community_ids))
+                    logger.info(f"从网络特征文件预加载社区 ID: {preloaded_community_ids}")
+            except Exception as e:
+                logger.warning(f"预加载网络特征失败: {e}")
+
         # ========== 准备数据 ==========
         print("\n" + "="*70)
         logger.info("准备训练数据")
         print("="*70)
 
-        df = self.prepare_data(codes, start_date, end_date, horizon,
-                               min_return_threshold=min_return_threshold,
-                               label_type='relative')  # 个股选股模型使用相对标签
+        df = self.prepare_data(codes, start_date, end_date, horizon, min_return_threshold=min_return_threshold, community_ids=preloaded_community_ids)
 
-        # 删除包含 NaN 的行
+        # 提取并保存社区 ID 列表（用于预测时的一致性）
+        # 优先使用预加载的社区 ID，如果没有则从数据中提取
+        if preloaded_community_ids is not None:
+            self.community_ids = preloaded_community_ids
+            logger.info(f"使用预加载的社区 ID: {self.community_ids}")
+        elif 'net_community_id' in df.columns:
+            self.community_ids = sorted([int(c) for c in df['net_community_id'].dropna().unique() if c >= 0])
+            logger.info(f"从训练数据提取社区 ID: {self.community_ids}")
+        else:
+            self.community_ids = None
+            logger.warning("训练数据中未找到网络社区特征")
+
+        # 删除包含 NaN 的行（仅标签和关键列，保留基本面特征的NaN）
         df = df.dropna(subset=['Label'])
+        # 删除其他关键列的NaN（非基本面特征）
+        critical_cols = ['Return_1d', 'Return_5d', 'Return_20d', 'Close', 'Volume']
+        critical_cols_existing = [c for c in critical_cols if c in df.columns]
+        if critical_cols_existing:
+            df = df.dropna(subset=critical_cols_existing)
         print(f"删除 NaN 后: {len(df)} 条记录")
-
-        # 计算时间衰减权重（在dropna之后，确保索引对齐）
-        self.sample_weights = None
-        if self.time_decay_lambda > 0:
-            self.sample_weights = self._compute_time_decay_weights(df, self.time_decay_lambda)
 
         # 获取特征列
         self.feature_columns = self.get_feature_columns(df)
@@ -5955,7 +5072,7 @@ class CatBoostModel(BaseTradingModel):
         # ========== 特征选择（可选）==========
         if use_feature_selection:
             print("\n" + "="*70)
-            print("🔍 应用特征选择（已弃用）")
+            print("🔍 应用特征选择...")
             print("="*70)
 
             # 加载选择的特征
@@ -5964,7 +5081,7 @@ class CatBoostModel(BaseTradingModel):
             if selected_features:
                 # 筛选特征列
                 self.feature_columns = [col for col in self.feature_columns if col in selected_features]
-                print(f"✅ 特征数量: {len(self.feature_columns)}（特征选择 - 已弃用）")
+                print(f"✅ 特征数量: {len(self.feature_columns)}（特征选择）")
             else:
                 logger.warning(r"未找到特征选择文件，使用全部特征")
         else:
@@ -5983,8 +5100,8 @@ class CatBoostModel(BaseTradingModel):
         
         # 识别分类特征（字符串类型）
         self.categorical_encoders = {}
-        categorical_features = []
-        
+        categorical_features_indices = []
+
         for col in self.feature_columns:
             if df[col].dtype == 'object':
                 print(f"  检测到分类特征: {col}")
@@ -5993,59 +5110,67 @@ class CatBoostModel(BaseTradingModel):
                 encoder = LabelEncoder()
                 df[col] = encoder.fit_transform(df[col])
                 self.categorical_encoders[col] = encoder
-                categorical_features.append(self.feature_columns.index(col))
-        
+                # 记录分类特征的索引（用于CatBoost）
+                categorical_features_indices.append(self.feature_columns.index(col))
+
         X = df[self.feature_columns].values
         y = df['Label'].values
 
+        # 关键：分类特征已被LabelEncoder编码为整数，numpy会自动转为float
+        # 此时不应再传递cat_features参数，否则CatBoost会报错
+        # 因为cat_features参数要求数据中包含实际的字符串/分类类型
+        # 但我们已将分类特征编码为数值，所以cat_features应为None
+        categorical_features = None  # 不使用cat_features，因为数据已是数值型
+
         print(f"训练数据形状: X={X.shape}, y={y.shape}")
-        print(f"分类特征数量: {len(categorical_features)}")
+        print(f"已编码分类特征数量: {len(categorical_features_indices)} (已转为数值，不使用cat_features)")
 
         # ========== 训练 CatBoost 模型 ==========
         print("\n" + "="*70)
         print("🐱 训练 CatBoost 模型")
         print("="*70)
 
-        # 根据预测周期调整参数
+        # 根据预测周期调整参数（统一使用20天调优参数）
         if horizon == 5:
-            # 一周模型参数（防过拟合）
-            print("使用一周模型参数（减少树深度，增加早停耐心）...")
-            n_estimators = 500
-            depth = 6  # 减少深度（7→6）
-            learning_rate = 0.05
-            stopping_rounds = 50  # 增加早停耐心（30→50）
-            l2_leaf_reg = 3  # 增加L2正则（2→3）
-            subsample = 0.7
-            colsample_bylevel = 0.6
-        elif horizon == 1:
-            # 次日模型参数（适度）
-            print("使用次日模型参数...")
-            n_estimators = 500
-            depth = 7
-            learning_rate = 0.05
-            stopping_rounds = 40
-            l2_leaf_reg = 3
+            # 一周模型参数（与20天模型统一）
+            print("使用一周模型参数（统一参数）...")
+            n_estimators = 400
+            depth = 8
+            learning_rate = 0.06
+            stopping_rounds = 80
+            l2_leaf_reg = 2
             subsample = 0.75
-            colsample_bylevel = 0.7
+            colsample_bylevel = 0.8
+        elif horizon == 1:
+            # 次日模型参数（与20天模型统一）
+            print("使用次日模型参数（统一参数）...")
+            n_estimators = 400
+            depth = 8
+            learning_rate = 0.06
+            stopping_rounds = 80
+            l2_leaf_reg = 2
+            subsample = 0.75
+            colsample_bylevel = 0.8
         else:  # horizon == 20
-            # 一个月模型参数（适配 730 特征版本）
-            # 2026-04-29：手动调优最优参数（夏普0.9059，回撤-0.20%）
-            # 注：系统调优参数在快速验证表现好但完整验证泛化不足
-            print("使用20天模型参数（手动调优最优版，730特征）...")
-            n_estimators = 600  # 树数量
-            depth = 7  # 树深度
-            learning_rate = 0.03  # 学习率（保守）
+            # 一个月模型参数（特征选择版本）
+            # 2026-05-09：系统调优最优参数（准确率64.02%，夏普0.8027）
+            # 调优结果：depth 7→8, learning_rate 0.04→0.06, colsample_bylevel 0.6→0.8
+            print("使用20天模型参数（系统调优最优版）...")
+            n_estimators = 400  # 树数量
+            depth = 8  # 树深度（增加复杂度）
+            learning_rate = 0.06  # 学习率（加快收敛）
             stopping_rounds = 80  # 早停耐心
             l2_leaf_reg = 2  # L2正则化
             subsample = 0.75  # 行采样
-            colsample_bylevel = 0.75  # 列采样
+            colsample_bylevel = 0.8  # 列采样（增加特征多样性）
 
         from catboost import CatBoostClassifier, Pool
 
         # 准备类别权重参数
+        # 注意：分类特征已用LabelEncoder编码为数值，不使用cat_features参数
         catboost_params = {
             'loss_function': 'Logloss',
-            'eval_metric': 'AUC',  # P3-7: 改为 AUC，与排序目标对齐（原 Accuracy）
+            'eval_metric': 'Accuracy',
             'depth': depth,
             'learning_rate': learning_rate,
             'n_estimators': n_estimators,
@@ -6056,8 +5181,8 @@ class CatBoostModel(BaseTradingModel):
             'verbose': 100,
             'early_stopping_rounds': stopping_rounds,
             'thread_count': -1,
-            'allow_writing_files': False,
-            'cat_features': categorical_features if categorical_features else None
+            'allow_writing_files': False
+            # cat_features 不设置，因为分类特征已编码为数值
         }
         
         # 添加类别权重（温和调整）
@@ -6075,16 +5200,6 @@ class CatBoostModel(BaseTradingModel):
         else:
             logger.info("不使用类别权重")
 
-        # 构建单调约束（防止特征方向翻转）
-        monotone_constraints = self._build_monotone_constraints(self.feature_columns)
-        if monotone_constraints is not None:
-            catboost_params['monotone_constraints'] = monotone_constraints
-            constrained_pos = sum(1 for c in monotone_constraints if c == 1)
-            constrained_neg = sum(1 for c in monotone_constraints if c == -1)
-            logger.info(f"已启用单调约束: +1={constrained_pos}, -1={constrained_neg}")
-        else:
-            logger.info("单调约束已禁用")
-
         self.catboost_model = CatBoostClassifier(**catboost_params)
 
         # 使用时间序列交叉验证（添加 gap 参数避免短期依赖）
@@ -6096,24 +5211,10 @@ class CatBoostModel(BaseTradingModel):
             X_train_fold, X_val_fold = X[train_idx], X[val_idx]
             y_train_fold, y_val_fold = y[train_idx], y[val_idx]
 
-            # 计算当前fold的权重子集
-            fold_weights = None
-            if self.sample_weights is not None:
-                fold_weights = self.sample_weights[train_idx]
-
             # 创建 Pool 对象（CatBoost 推荐）
-            train_pool = Pool(
-                data=X_train_fold,
-                label=y_train_fold,
-                cat_features=categorical_features if categorical_features else None,
-                weight=fold_weights  # 时间衰减权重
-            )
-            val_pool = Pool(
-                data=X_val_fold,
-                label=y_val_fold,
-                cat_features=categorical_features if categorical_features else None
-                # 验证集不使用权重（权重只影响训练）
-            )
+            # 注意：分类特征已编码为数值，不传递cat_features参数
+            train_pool = Pool(data=X_train_fold, label=y_train_fold)
+            val_pool = Pool(data=X_val_fold, label=y_val_fold)
 
             self.catboost_model.fit(
                 train_pool,
@@ -6128,13 +5229,8 @@ class CatBoostModel(BaseTradingModel):
             catboost_f1_scores.append(f1)
             print(f"   Fold {fold} 验证准确率: {score:.4f}, 验证F1分数: {f1:.4f}")
 
-        # 使用全部数据重新训练（带时间衰减权重）
-        full_pool = Pool(
-            data=X,
-            label=y,
-            cat_features=categorical_features if categorical_features else None,
-            weight=self.sample_weights  # 时间衰减权重
-        )
+        # 使用全部数据重新训练
+        full_pool = Pool(data=X, label=y)
         self.catboost_model.fit(full_pool, verbose=100)
 
         # 获取实际训练的树数量
@@ -6280,6 +5376,52 @@ class CatBoostModel(BaseTradingModel):
                         stock_df = cached_df
                         logger.debug(f"预测使用特征缓存: {cache_key}")
                         use_cache_predict = True
+                        # 即使使用缓存，也要加载网络特征（因为网络特征是跨截面的，可能已更新）
+                        # 如果股票没有网络特征，使用默认值
+                        network_features_file = 'output/network_features_for_ml.json'
+                        has_network_features = False
+                        if os.path.exists(network_features_file):
+                            try:
+                                with open(network_features_file, 'r') as f:
+                                    network_features_data = json.load(f)
+                                if code in network_features_data:
+                                    net_features = network_features_data[code]
+                                    for key, value in net_features.items():
+                                        stock_df[key] = value
+                                    has_network_features = True
+                                    logger.debug(f"网络特征已加载到缓存数据")
+                            except Exception as e:
+                                logger.debug(f"网络特征加载失败: {e}")
+
+                        if not has_network_features:
+                            # 为缺失网络特征的股票提供默认值（使用新的连续值特征）
+                            default_net_features = {
+                                'net_degree_centrality': 0.0,
+                                'net_betweenness_centrality': 0.0,
+                                'net_eigenvector_centrality': 0.0,
+                                'net_closeness_centrality': 0.0,
+                                'net_composite_centrality': 0.0,
+                                'net_community_id': -1,  # -1 表示未知社区
+                                'net_community_size': 0,
+                                'net_community_centrality_rank': -1,  # -1表示未知社区
+                                'net_sector_cohesion': 0.0,
+                                'net_mst_degree': 0,
+                                'net_mst_neighbor_sectors': 0,
+                                'net_inter_community_ratio': 0.0,
+                                # 结构洞特征默认值
+                                'net_constraint': 1.0,  # 高约束=无机会
+                                'net_effective_size': 0.0,
+                                'net_local_clustering': 0.0,
+                            }
+                            for key, value in default_net_features.items():
+                                stock_df[key] = value
+                            logger.debug(f"股票 {code} 使用默认网络特征（社区 ID = -1）")
+
+            # 生成市场-网络交叉特征（无论是否使用缓存，都需要调用）
+            # 因为网络特征可能已更新，且交叉特征依赖于网络特征
+            # 使用训练时保存的社区 ID 列表，确保特征一致性
+            stock_df = self.feature_engineer.create_market_network_interaction_features(
+                stock_df, community_ids=self.community_ids)
 
             if not use_cache_predict:
                 # 计算特征
@@ -6365,7 +5507,45 @@ class CatBoostModel(BaseTradingModel):
                 for key, value in sector_features.items():
                     stock_df[key] = value
 
-                # 网络特征已移除：存在数据泄漏风险，作为独立分析工具使用
+                # 添加网络特征（从预计算文件加载，与训练时保持一致）
+                # 如果股票没有网络特征，使用默认值（社区 ID = -1 表示未知）
+                network_features_file = 'output/network_features_for_ml.json'
+                has_network_features = False
+                if os.path.exists(network_features_file):
+                    try:
+                        with open(network_features_file, 'r') as f:
+                            network_features_data = json.load(f)
+                        if code in network_features_data:
+                            net_features = network_features_data[code]
+                            for key, value in net_features.items():
+                                stock_df[key] = value
+                            has_network_features = True
+                    except Exception as e:
+                        logger.debug(f"网络特征加载失败: {e}")
+
+                if not has_network_features:
+                    # 为缺失网络特征的股票提供默认值（使用新的连续值特征）
+                    default_net_features = {
+                        'net_degree_centrality': 0.0,
+                        'net_betweenness_centrality': 0.0,
+                        'net_eigenvector_centrality': 0.0,
+                        'net_closeness_centrality': 0.0,
+                        'net_composite_centrality': 0.0,
+                        'net_community_id': -1,  # -1 表示未知社区
+                        'net_community_size': 0,
+                        'net_community_centrality_rank': -1,  # -1表示未知社区
+                        'net_sector_cohesion': 0.0,
+                        'net_mst_degree': 0,
+                        'net_mst_neighbor_sectors': 0,
+                        'net_inter_community_ratio': 0.0,
+                        # 结构洞特征默认值
+                        'net_constraint': 1.0,  # 高约束=无机会
+                        'net_effective_size': 0.0,
+                        'net_local_clustering': 0.0,
+                    }
+                    for key, value in default_net_features.items():
+                        stock_df[key] = value
+                    logger.debug(f"股票 {code} 使用默认网络特征（社区 ID = -1）")
 
                 # 添加事件驱动特征（9个，与训练时保持一致）
                 stock_df = self.feature_engineer.create_event_driven_features(code, stock_df)
@@ -6375,50 +5555,6 @@ class CatBoostModel(BaseTradingModel):
 
                 # 生成交叉特征（与训练时保持一致）
                 stock_df = self.feature_engineer.create_interaction_features(stock_df)
-
-                # ========== 网络特征（与训练时保持一致）==========
-                # 预测时使用缓存的网络特征或默认值
-                # 网络特征需要跨截面计算，预测单只股票时使用默认值
-                # 注意：net_sector_community_match 和 net_mst_neighbor_sectors 已移除
-                network_feature_names = [
-                    'net_composite_centrality',
-                    'net_community_id',
-                    'net_node_deviation'
-                ]
-                for feat in network_feature_names:
-                    if feat not in stock_df.columns:
-                        stock_df[feat] = 0.0 if feat != 'net_community_id' else -1
-
-                # ========== 滚动百分位特征（与训练时保持一致）==========
-                # 如果训练时使用了滚动百分位，预测时也需要使用
-                if self.use_rolling_percentile:
-                    stock_df = self._calculate_rolling_percentile_features(stock_df)
-
-                # ========== 截面百分位特征（2026-05-03 新增）==========
-                # 注意：截面百分位需要当日所有股票数据，单只股票预测时无法计算
-                # 如果训练时使用了截面百分位，预测时需要确保特征列存在
-                if self.use_cross_sectional_percentile:
-                    # 检查是否有截面百分位特征，如果没有则跳过（使用原始特征）
-                    cs_pct_features = [f'{feat}_CS_Pct' for feat in self.CROSS_SECTIONAL_PERCENTILE_FEATURES]
-                    missing_features = [f for f in cs_pct_features if f not in stock_df.columns]
-                    if missing_features:
-                        logger.warning(f"截面百分位特征 {missing_features} 不存在（单只股票预测时无法计算），将使用原始特征")
-
-                if self.use_cross_sectional_zscore:
-                    # 检查是否有截面 Z-Score 特征，如果没有则跳过（使用原始特征）
-                    cs_zscore_features = [f'{feat}_CS_ZScore' for feat in self.CROSS_SECTIONAL_ZSCORE_FEATURES]
-                    missing_zscore_features = [f for f in cs_zscore_features if f not in stock_df.columns]
-                    if missing_zscore_features:
-                        logger.warning(f"截面 Z-Score 特征 {missing_zscore_features} 不存在（单只股票预测时无法计算），将使用原始特征")
-
-                # ========== 特征残差化（与训练时保持一致）==========
-                # 如果训练时使用了残差化，预测时也需要使用
-                if hasattr(self, 'residualizer') and self.residualizer is not None:
-                    try:
-                        stock_df = self.residualizer.residualize(stock_df, inplace=True, keep_original=False)
-                        logger.debug("预测时特征残差化完成")
-                    except Exception as e:
-                        logger.warning(f"预测时特征残差化失败: {e}")
 
                 # 保存特征缓存
                 if use_feature_cache:
@@ -6434,37 +5570,56 @@ class CatBoostModel(BaseTradingModel):
                 'Earnings_Announcement_In_7d', 'Earnings_Announcement_In_30d', 'Days_Since_Last_Earnings',
                 'Earnings_Surprise_Score', 'Earnings_Surprise_Avg_3', 'Earnings_Surprise_Trend'
             ]
+            # Days_Since_Last_Earnings 使用 -1 表示未知，其他使用 0
             for feat in event_features:
                 if feat not in latest_data.columns:
-                    logger.warning(f"警告: 事件驱动特征 {feat} 不存在，使用默认值0")
+                    if feat == 'Days_Since_Last_Earnings':
+                        logger.warning(f"警告: 事件驱动特征 {feat} 不存在，使用默认值-1（未知）")
+                        latest_data[feat] = -1
+                    else:
+                        logger.warning(f"警告: 事件驱动特征 {feat} 不存在，使用默认值0")
+                        latest_data[feat] = 0.0
+
+            # 确保所有基本面特征都存在（容错处理）
+            # 当 create_fundamental_features 获取数据失败时，需要提供默认值
+            # 使用 NaN 表示缺失，让 CatBoost 自动学习缺失模式
+            fundamental_features_default = {
+                'PE': float('nan'), 'PB': float('nan'), 'Market_Cap': float('nan'),
+                'ROE': float('nan'), 'ROA': float('nan'), 'Dividend_Yield': 0.0,
+                'EPS': float('nan'), 'Net_Margin': float('nan'), 'Gross_Margin': float('nan')
+            }
+            for feat, default_val in fundamental_features_default.items():
+                if feat not in latest_data.columns:
+                    logger.warning(f"警告: 基本面特征 {feat} 不存在，使用默认值{default_val}")
+                    latest_data[feat] = default_val
+
+            # 确保所有基本面交互特征都存在（容错处理）
+            # 这些特征由 create_interaction_features 生成，当基本面数据缺失时需要默认值
+            interaction_features_default = [
+                # Outperforms_HSI 系列
+                'Outperforms_HSI_ROE', 'Outperforms_HSI_ROA', 'Outperforms_HSI_Net_Margin',
+                'Outperforms_HSI_Gross_Margin', 'Outperforms_HSI_Dividend_Yield',
+                # Strong_Volume_Up 系列
+                'Strong_Volume_Up_ROE', 'Strong_Volume_Up_ROA', 'Strong_Volume_Up_Net_Margin',
+                'Strong_Volume_Up_Gross_Margin', 'Strong_Volume_Up_Dividend_Yield',
+                # Weak_Volume_Down 系列
+                'Weak_Volume_Down_ROE', 'Weak_Volume_Down_ROA', 'Weak_Volume_Down_Net_Margin',
+                'Weak_Volume_Down_Gross_Margin', 'Weak_Volume_Down_Dividend_Yield',
+                # Trend 系列 (3d, 5d, 10d, 20d, 60d)
+                '3d_Trend_ROE', '3d_Trend_ROA', '3d_Trend_Net_Margin', '3d_Trend_Gross_Margin', '3d_Trend_Dividend_Yield',
+                '5d_Trend_ROE', '5d_Trend_ROA', '5d_Trend_Net_Margin', '5d_Trend_Gross_Margin', '5d_Trend_Dividend_Yield',
+                '10d_Trend_ROE', '10d_Trend_ROA', '10d_Trend_Net_Margin', '10d_Trend_Gross_Margin', '10d_Trend_Dividend_Yield',
+                '20d_Trend_ROE', '20d_Trend_ROA', '20d_Trend_Net_Margin', '20d_Trend_Gross_Margin', '20d_Trend_Dividend_Yield',
+                '60d_Trend_ROE', '60d_Trend_ROA', '60d_Trend_Net_Margin', '60d_Trend_Gross_Margin', '60d_Trend_Dividend_Yield',
+            ]
+            for feat in interaction_features_default:
+                if feat not in latest_data.columns:
+                    logger.debug(f"基本面交互特征 {feat} 不存在，使用默认值0")
                     latest_data[feat] = 0.0
 
             # 准备特征
             if len(self.feature_columns) == 0:
                 raise ValueError("模型未训练，请先调用train()方法")
-
-            # 处理缺失的截面特征（单只股票预测时无法计算）
-            # 优先使用训练集统计量的均值，这是更合理的中性值
-            cs_feature_suffixes = ['_CS_Pct', '_CS_ZScore']
-            missing_cs_features = False
-            for suffix in cs_feature_suffixes:
-                cs_features = [col for col in self.feature_columns if col.endswith(suffix)]
-                for cs_feat in cs_features:
-                    if cs_feat not in latest_data.columns:
-                        missing_cs_features = True
-                        # 优先使用训练集统计量的均值
-                        if hasattr(self, 'cs_feature_stats') and cs_feat in self.cs_feature_stats:
-                            latest_data[cs_feat] = self.cs_feature_stats[cs_feat]['mean']
-                            logger.debug(f"截面特征 {cs_feat} 使用训练集均值回退")
-                        else:
-                            # 最终回退：_CS_Pct 用 0.5（中位数），_CS_ZScore 用 0.0（均值）
-                            latest_data[cs_feat] = 0.5 if suffix == '_CS_Pct' else 0.0
-                            logger.warning(f"截面特征 {cs_feat} 缺失统计量，使用默认值 {latest_data[cs_feat].values[0]}")
-
-            # 单股预测降级警告
-            if missing_cs_features and (self.use_cross_sectional_percentile or self.use_cross_sectional_zscore):
-                logger.warning("predict() 单股预测时截面特征使用训练集均值回退，精度降低。"
-                              "建议使用 predict_batch() 获取正确的截面特征。")
 
             # 处理分类特征（使用训练时的编码器）
             for col, encoder in self.categorical_encoders.items():
@@ -6502,10 +5657,9 @@ class CatBoostModel(BaseTradingModel):
             # 使用 CatBoost 模型直接预测
             from catboost import Pool
 
-            # 获取分类特征索引
-            categorical_features = [self.feature_columns.index(col) for col in self.categorical_encoders.keys() if col in self.feature_columns]
-
-            test_pool = Pool(data=X, cat_features=categorical_features if categorical_features else None)
+            # 分类特征已用 LabelEncoder 编码为数值，不使用 cat_features 参数
+            # 因为 X 是 float 类型的 numpy 数组，CatBoost 不接受 cat_features
+            test_pool = Pool(data=X)
             proba = self.catboost_model.predict_proba(test_pool)[0]
             prediction = self.catboost_model.predict(test_pool)[0]
 
@@ -6524,418 +5678,6 @@ class CatBoostModel(BaseTradingModel):
             traceback.print_exc()
             return None
 
-    def _extract_raw_features_single(self, code, predict_date=None, horizon=None, use_feature_cache=True):
-        """提取单只股票的原始特征（不含截面特征），供批量预测使用
-
-        Args:
-            code: 股票代码
-            predict_date: 预测日期 (YYYY-MM-DD)
-            horizon: 预测周期
-            use_feature_cache: 是否使用特征缓存
-
-        Returns:
-            DataFrame: 带特征的 stock_df（含 Code 列），或 None
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        try:
-            stock_code = code.replace('.HK', '')
-
-            # 获取股票数据
-            stock_df = get_hk_stock_data_tencent(stock_code, period_days=1460)
-            if stock_df is None or stock_df.empty:
-                return None
-
-            # 如果指定了预测日期，过滤数据到该日期
-            if predict_date:
-                predict_date = pd.to_datetime(predict_date)
-                predict_date_str = predict_date.strftime('%Y-%m-%d')
-
-                if not isinstance(stock_df.index, pd.DatetimeIndex):
-                    stock_df.index = pd.to_datetime(stock_df.index)
-
-                stock_df = stock_df[stock_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-
-                if stock_df.empty:
-                    logger.warning(f"股票 {code} 在日期 {predict_date_str} 之前没有数据")
-                    return None
-
-            # 获取数据最后日期作为缓存键
-            last_date = stock_df.index[-1].strftime('%Y%m%d') if hasattr(stock_df.index[-1], 'strftime') else str(stock_df.index[-1])[:10].replace('-', '')
-
-            # 尝试加载特征缓存
-            cache_key = _get_feature_cache_key(stock_code, last_date)
-            cache_file_path = _get_feature_cache_file_path(cache_key)
-
-            use_cache_predict = False
-            if use_feature_cache and _is_feature_cache_valid(cache_file_path):
-                cached_data = _load_feature_cache(cache_file_path)
-                if cached_data is not None and 'stock_df' in cached_data:
-                    cached_df = cached_data['stock_df']
-                    required_new_cols = ['GARCH_Conditional_Vol', 'HSI_Market_Regime', 'net_composite_centrality']
-                    missing_cols = [c for c in required_new_cols if c not in cached_df.columns]
-                    if missing_cols:
-                        logger.debug(f"预测缓存缺少新特征: {missing_cols}，重新计算...")
-                    else:
-                        stock_df = cached_df
-                        logger.debug(f"预测使用特征缓存: {cache_key}")
-                        use_cache_predict = True
-
-            if not use_cache_predict:
-                # 计算特征
-                hsi_df = get_hsi_data_tencent(period_days=1460)
-                if hsi_df is None or hsi_df.empty:
-                    hsi_df = None
-
-                us_market_df = us_market_data.get_all_us_market_data(period_days=1460)
-
-                if predict_date and hsi_df is not None:
-                    if not isinstance(hsi_df.index, pd.DatetimeIndex):
-                        hsi_df.index = pd.to_datetime(hsi_df.index)
-                    hsi_df = hsi_df[hsi_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-                    if us_market_df is not None and not isinstance(us_market_df.index, pd.DatetimeIndex):
-                        us_market_df.index = pd.to_datetime(us_market_df.index)
-                    if us_market_df is not None:
-                        us_market_df = us_market_df[us_market_df.index.strftime('%Y-%m-%d') <= predict_date_str]
-
-                # 计算所有特征（与 predict() 保持一致）
-                stock_df = self.feature_engineer.calculate_technical_features(stock_df)
-                stock_df = self.feature_engineer.calculate_multi_period_metrics(stock_df)
-
-                if hsi_df is not None:
-                    stock_df = self.feature_engineer.calculate_relative_strength(stock_df, hsi_df)
-                    hsi_regime_df_predict = None
-                    try:
-                        regime_detector = RegimeDetector()
-                        hsi_with_regime = regime_detector.calculate_features(hsi_df.copy())
-                        rename_map = {c: f'HSI_{c}' for c in RegimeDetector.get_feature_names()}
-                        hsi_regime_df_predict = hsi_with_regime[RegimeDetector.get_feature_names()].rename(columns=rename_map)
-                    except Exception as e:
-                        logger.warning(f"HSI 市场状态特征计算失败: {e}")
-                    if hsi_regime_df_predict is not None:
-                        stock_df = self.feature_engineer.calculate_hsi_regime_features(stock_df, hsi_regime_df_predict)
-
-                stock_df = self.feature_engineer.create_smart_money_features(stock_df)
-
-                if hsi_df is not None:
-                    stock_df = self.feature_engineer.create_market_environment_features(stock_df, hsi_df, us_market_df)
-
-                fundamental_features = self.feature_engineer.create_fundamental_features(code)
-                for key, value in fundamental_features.items():
-                    stock_df[key] = value
-
-                stock_type_features = self.feature_engineer.create_stock_type_features(code, stock_df)
-                for key, value in stock_type_features.items():
-                    stock_df[key] = value
-
-                sentiment_features = self.feature_engineer.create_sentiment_features(code, stock_df)
-                for key, value in sentiment_features.items():
-                    stock_df[key] = value
-
-                topic_features = self.feature_engineer.create_topic_features(code, stock_df)
-                for key, value in topic_features.items():
-                    stock_df[key] = value
-
-                topic_sentiment_interaction = self.feature_engineer.create_topic_sentiment_interaction_features(code, stock_df)
-                for key, value in topic_sentiment_interaction.items():
-                    stock_df[key] = value
-
-                expectation_gap = self.feature_engineer.create_expectation_gap_features(code, stock_df)
-                for key, value in expectation_gap.items():
-                    stock_df[key] = value
-
-                sector_features = self.feature_engineer.create_sector_features(code, stock_df)
-                for key, value in sector_features.items():
-                    stock_df[key] = value
-
-                stock_df = self.feature_engineer.create_event_driven_features(code, stock_df)
-                stock_df = self.feature_engineer.create_technical_fundamental_interactions(stock_df)
-                stock_df = self.feature_engineer.create_interaction_features(stock_df)
-
-                # 网络特征默认值（注意：net_sector_community_match 和 net_mst_neighbor_sectors 已移除）
-                network_feature_names = [
-                    'net_composite_centrality', 'net_community_id', 'net_node_deviation'
-                ]
-                for feat in network_feature_names:
-                    if feat not in stock_df.columns:
-                        stock_df[feat] = 0.0 if feat != 'net_community_id' else -1
-
-                # 滚动百分位特征
-                if self.use_rolling_percentile:
-                    stock_df = self._calculate_rolling_percentile_features(stock_df)
-
-                # 特征残差化
-                if hasattr(self, 'residualizer') and self.residualizer is not None:
-                    try:
-                        stock_df = self.residualizer.residualize(stock_df, inplace=True, keep_original=False)
-                        logger.debug("预测时特征残差化完成")
-                    except Exception as e:
-                        logger.warning(f"预测时特征残差化失败: {e}")
-
-                # 保存特征缓存
-                if use_feature_cache:
-                    _save_feature_cache(cache_file_path, {'stock_df': stock_df})
-                    logger.debug(f"特征缓存已保存: {cache_key}")
-
-            # 添加股票代码列（用于批量预测时合并）
-            stock_df['Code'] = code
-
-            return stock_df
-
-        except Exception as e:
-            logger.warning(f"提取特征失败 {code}: {e}")
-            return None
-
-    def predict_batch(self, codes, predict_date=None, horizon=None, use_feature_cache=True):
-        """批量预测：先提取所有股票特征，再统一计算截面特征，最后逐只预测
-
-        核心改进：截面特征（_CS_Pct, _CS_ZScore）在所有股票数据上联合计算，
-        确保训练/预测一致，而非单只股票时退化为 0.5/0.0。
-
-        Args:
-            codes: 股票代码列表
-            predict_date: 预测日期 (YYYY-MM-DD)
-            horizon: 预测周期
-            use_feature_cache: 是否使用特征缓存
-
-        Returns:
-            list: 预测结果列表，每个元素为字典或 None
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        if len(self.feature_columns) == 0:
-            raise ValueError("模型未训练，请先调用train()方法")
-
-        logger.info(f"开始批量预测 {len(codes)} 只股票...")
-
-        # 阶段1：逐只提取原始特征
-        all_features = {}
-        for code in codes:
-            stock_df = self._extract_raw_features_single(code, predict_date, horizon, use_feature_cache)
-            if stock_df is not None:
-                all_features[code] = stock_df
-
-        if not all_features:
-            logger.warning("批量预测：没有成功提取任何股票的特征")
-            return []
-
-        logger.info(f"成功提取 {len(all_features)} 只股票的特征")
-
-        # 阶段2：合并所有股票，计算截面特征
-        combined = pd.concat(all_features.values())
-
-        # 统一索引时区：强制将所有时间戳转换为 tz-naive，避免 groupby 时比较错误
-        # 问题根源：不同股票数据可能来自不同源，索引时区状态不一致
-        # 当合并 tz-aware 和 tz-naive 索引时，pandas 会创建 object 类型 Index
-        def normalize_timestamp(ts):
-            '''将任意时间戳转换为 tz-naive'''
-            try:
-                if hasattr(ts, 'tz') and ts.tz is not None:
-                    return ts.tz_localize(None)
-                return ts
-            except Exception:
-                return pd.Timestamp(ts).tz_localize(None) if pd.Timestamp(ts).tz is not None else pd.Timestamp(ts)
-
-        # 检查索引是否为 object 类型（混合时区情况）
-        if combined.index.dtype == 'object' or (hasattr(combined.index, 'tz') and combined.index.tz is not None):
-            new_index = [normalize_timestamp(ts) for ts in combined.index]
-            combined.index = pd.DatetimeIndex(new_index)
-            logger.debug("批量预测：索引时区已统一为 tz-naive")
-
-        # 计算截面百分位特征
-        if self.use_cross_sectional_percentile:
-            combined = self._calculate_cross_sectional_percentile_features(combined)
-            logger.info("批量预测：截面百分位特征计算完成")
-
-        # 计算截面 Z-Score 特征
-        if self.use_cross_sectional_zscore:
-            combined = self._calculate_cross_sectional_zscore_features(combined)
-            logger.info("批量预测：截面 Z-Score 特征计算完成")
-
-        # ========== 网络特征（跨截面特征，所有股票共享）==========
-        # 批量预测时可以正确计算网络特征（需要所有股票数据）
-        try:
-            from data_services.network_features import get_network_calculator
-
-            logger.info("批量预测：计算网络特征...")
-            network_calc = get_network_calculator()
-
-            # 获取所有股票代码
-            unique_codes = combined['Code'].unique().tolist()
-
-            # 计算网络洞察（中心性、社区等）
-            insights = network_calc.calculate_network_insights(unique_codes, force_refresh=False)
-
-            # 计算节点偏离度（动量网络特征）
-            deviations = network_calc.calculate_node_deviation(unique_codes, score_type='momentum', window=20)
-
-            # P7 新增：计算不同窗口的节点偏离度，用于增量特征
-            deviations_5d = network_calc.calculate_node_deviation(unique_codes, score_type='momentum', window=5)
-
-            # 将网络特征添加到每只股票的数据中
-            network_feature_names = [
-                'net_composite_centrality',
-                'net_community_id',
-                'net_node_deviation',
-                # P7 新增：增量网络特征
-                'net_node_deviation_delta_5d',  # 节点偏离度变化率
-                'net_node_deviation_accel',     # 节点偏离度加速度
-            ]
-
-            # 初始化网络特征列
-            for feat in network_feature_names:
-                combined[feat] = 0.0 if feat != 'net_community_id' else -1
-
-            # 填充网络特征
-            for code in unique_codes:
-                mask = combined['Code'] == code
-
-                # 中心性
-                if code in insights:
-                    combined.loc[mask, 'net_composite_centrality'] = insights[code].get('composite_centrality', 0)
-
-                # 社区ID（分类特征）
-                if code in insights:
-                    combined.loc[mask, 'net_community_id'] = insights[code].get('community', -1)
-
-                # 节点偏离度
-                dev_20d = deviations.get(code, {}).get('node_deviation', 0) if code in deviations else 0
-                dev_5d = deviations_5d.get(code, {}).get('node_deviation', 0) if code in deviations_5d else 0
-
-                combined.loc[mask, 'net_node_deviation'] = dev_20d
-
-                # P7 新增：增量特征
-                combined.loc[mask, 'net_node_deviation_delta_5d'] = dev_20d - dev_5d
-                combined.loc[mask, 'net_node_deviation_accel'] = (dev_20d - dev_5d) / (abs(dev_5d) + 0.001)  # 归一化
-
-            logger.info(f"批量预测：网络特征计算完成（{len(unique_codes)} 只股票）")
-
-        except Exception as e:
-            logger.warning(f"批量预测：网络特征计算失败: {e}，将使用默认值")
-            # 使用默认值
-            network_feature_names = [
-                'net_composite_centrality',
-                'net_community_id',
-                'net_node_deviation',
-                'net_node_deviation_delta_5d',
-                'net_node_deviation_accel',
-            ]
-            for feat in network_feature_names:
-                if feat not in combined.columns:
-                    combined[feat] = 0.0 if feat != 'net_community_id' else -1
-
-        # 阶段3：逐只预测（使用正确的截面特征）
-        results = []
-        for code in all_features.keys():
-            stock_data = combined[combined['Code'] == code]
-            if stock_data.empty:
-                continue
-
-            latest = stock_data.iloc[-1:].copy()
-
-            # 使用辅助方法进行预测
-            result = self._predict_from_features(code, latest, horizon)
-            if result:
-                results.append(result)
-
-        logger.info(f"批量预测完成：{len(results)}/{len(codes)} 只股票")
-        return results
-
-    def _predict_from_features(self, code, latest_data, horizon=None):
-        """从特征数据进行预测（供 predict() 和 predict_batch() 共用）
-
-        Args:
-            code: 股票代码
-            latest_data: 单行 DataFrame，包含所有特征
-            horizon: 预测周期
-
-        Returns:
-            dict: 预测结果，或 None
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        try:
-            # 确保所有事件驱动特征都存在
-            event_features = [
-                'Ex_Dividend_In_7d', 'Ex_Dividend_In_30d', 'Dividend_Frequency_12m',
-                'Earnings_Announcement_In_7d', 'Earnings_Announcement_In_30d', 'Days_Since_Last_Earnings',
-                'Earnings_Surprise_Score', 'Earnings_Surprise_Avg_3', 'Earnings_Surprise_Trend'
-            ]
-            for feat in event_features:
-                if feat not in latest_data.columns:
-                    logger.warning(f"事件驱动特征 {feat} 不存在，使用默认值0")
-                    latest_data[feat] = 0.0
-
-            # 处理缺失的网络特征（P7 增量特征）
-            network_features = [
-                'net_composite_centrality', 'net_community_id', 'net_node_deviation',
-                'net_node_deviation_delta_5d', 'net_node_deviation_accel'
-            ]
-            for feat in network_features:
-                if feat not in latest_data.columns:
-                    logger.warning(f"网络特征 {feat} 不存在，使用默认值")
-                    latest_data[feat] = 0.0 if feat != 'net_community_id' else -1
-
-            # 处理缺失的截面特征（使用训练集统计量回退）
-            cs_feature_suffixes = ['_CS_Pct', '_CS_ZScore']
-            for suffix in cs_feature_suffixes:
-                cs_features = [col for col in self.feature_columns if col.endswith(suffix)]
-                for cs_feat in cs_features:
-                    if cs_feat not in latest_data.columns:
-                        # 优先使用训练集统计量的均值
-                        if hasattr(self, 'cs_feature_stats') and cs_feat in self.cs_feature_stats:
-                            latest_data[cs_feat] = self.cs_feature_stats[cs_feat]['mean']
-                        else:
-                            # 最终回退：_CS_Pct 用 0.5（中位数），_CS_ZScore 用 0.0（均值）
-                            latest_data[cs_feat] = 0.5 if suffix == '_CS_Pct' else 0.0
-
-            # 处理分类特征
-            for col, encoder in self.categorical_encoders.items():
-                if col in latest_data.columns:
-                    try:
-                        latest_data[col] = latest_data[col].fillna('unknown').astype(str)
-                        latest_data[col] = encoder.transform(latest_data[col])
-                    except ValueError:
-                        logger.warning(f"分类特征 {col} 包含训练时未见过的类别，使用默认值")
-                        latest_data[col] = 0
-
-            X = latest_data[self.feature_columns].values
-
-            # 处理 NaN
-            df_temp = pd.DataFrame(X, columns=self.feature_columns)
-            categorical_cols = list(self.categorical_encoders.keys())
-            numeric_cols = [col for col in self.feature_columns if col not in categorical_cols]
-
-            for col in numeric_cols:
-                if col in df_temp.columns:
-                    df_temp[col] = df_temp[col].fillna(0.0)
-
-            X = df_temp.values
-
-            # CatBoost 预测
-            from catboost import Pool
-            categorical_features = [self.feature_columns.index(col) for col in self.categorical_encoders.keys() if col in self.feature_columns]
-
-            test_pool = Pool(data=X, cat_features=categorical_features if categorical_features else None)
-            proba = self.catboost_model.predict_proba(test_pool)[0]
-            prediction = self.catboost_model.predict(test_pool)[0]
-
-            return {
-                'code': code,
-                'name': STOCK_NAMES.get(code, code),
-                'prediction': int(prediction),
-                'probability': float(proba[1]),
-                'current_price': float(latest_data['Close'].values[0]),
-                'date': latest_data.index[0]
-            }
-
-        except Exception as e:
-            logger.warning(f"预测失败 {code}: {e}")
-            return None
-
     def save_model(self, filepath):
         """保存模型"""
         model_data = {
@@ -6945,16 +5687,7 @@ class CatBoostModel(BaseTradingModel):
             'horizon': self.horizon,
             'model_type': self.model_type,
             'categorical_encoders': self.categorical_encoders,
-            'residualizer': getattr(self, 'residualizer', None),  # 保存残差化器
-            # 新增：Regime Shift 修复参数
-            'use_monotone_constraints': self.use_monotone_constraints,
-            'monotone_constraints_list': self.monotone_constraints_list,
-            'time_decay_lambda': self.time_decay_lambda,
-            'use_rolling_percentile': self.use_rolling_percentile,
-            'use_cross_sectional_percentile': self.use_cross_sectional_percentile,  # 2026-05-03 新增
-            'use_cross_sectional_zscore': self.use_cross_sectional_zscore,  # 2026-05-03 新增
-            'cs_feature_stats': getattr(self, 'cs_feature_stats', {}),  # 2026-05-03 新增：截面特征统计量
-            'feature_importance_threshold': self.feature_importance_threshold,  # P3-8 新增
+            'community_ids': self.community_ids  # 保存社区 ID 列表
         }
         with open(filepath, 'wb') as f:
             pickle.dump(model_data, f)
@@ -6970,17 +5703,11 @@ class CatBoostModel(BaseTradingModel):
         self.horizon = model_data.get('horizon', 1)
         self.model_type = model_data.get('model_type', 'catboost')
         self.categorical_encoders = model_data.get('categorical_encoders', {})
-        self.residualizer = model_data.get('residualizer', None)  # 加载残差化器
-        # 新增：Regime Shift 修复参数（向后兼容）
-        self.use_monotone_constraints = model_data.get('use_monotone_constraints', False)
-        self.monotone_constraints_list = model_data.get('monotone_constraints_list', None)
-        self.time_decay_lambda = model_data.get('time_decay_lambda', 0)  # 默认0=无衰减（向后兼容）
-        self.use_rolling_percentile = model_data.get('use_rolling_percentile', False)
-        self.use_cross_sectional_percentile = model_data.get('use_cross_sectional_percentile', False)  # 2026-05-03 新增
-        self.use_cross_sectional_zscore = model_data.get('use_cross_sectional_zscore', False)  # 2026-05-03 新增
-        self.cs_feature_stats = model_data.get('cs_feature_stats', {})  # 2026-05-03 新增：截面特征统计量
-        self.feature_importance_threshold = model_data.get('feature_importance_threshold', 0.0)  # P3-8 新增
-        print(f"CatBoost 模型已从 {filepath} 加载")
+        self.community_ids = model_data.get('community_ids', None)  # 恢复社区 ID 列表
+        if self.community_ids:
+            print(f"CatBoost 模型已从 {filepath} 加载（社区 ID: {self.community_ids}）")
+        else:
+            print(f"CatBoost 模型已从 {filepath} 加载")
 
     def predict_proba(self, X):
         """
@@ -7028,11 +5755,9 @@ class CatBoostModel(BaseTradingModel):
                     lambda x: encoder.transform([x])[0] if x in encoder.classes_ else -1
                 )
 
-        # 获取分类特征索引
-        categorical_features = [self.feature_columns.index(col) for col in self.categorical_encoders.keys() if col in self.feature_columns]
-
-        # 创建 Pool 对象
-        test_pool = Pool(data=test_df, cat_features=categorical_features if categorical_features else None)
+        # 分类特征已用 LabelEncoder 编码为数值，不使用 cat_features 参数
+        # 因为 test_df 是 float 类型的 numpy 数组，CatBoost 不接受 cat_features
+        test_pool = Pool(data=test_df)
 
         # 返回预测概率
         return self.catboost_model.predict_proba(test_pool)
@@ -7504,569 +6229,8 @@ class AdvancedDynamicStrategy:
         
         # 融合
         fused_prob = sum(pred * w for pred, w in zip(predictions, weights))
-
+        
         return fused_prob, f'advanced_{regime}'
-
-
-class CatBoostRankerModel(BaseTradingModel):
-    """CatBoost 排序模型 - 直接优化股票排序，最大化 Rank IC
-
-    P3-9: 与 CatBoostClassifier 的关键区别：
-    1. 使用 CatBoostRanker（排序模型）而非 CatBoostClassifier（分类模型）
-    2. 标签为连续 Future_Return（而非二元 0/1），保留收益幅度信息
-    3. 使用 group_id=date 分组，每个日期形成一个排序组
-    4. 损失函数为 YetiRank（直接优化排序），而非 Logloss（优化分类）
-    5. 输出为排序分数（而非概率），分数越高表示预期收益越高
-    """
-
-    # 复用 CatBoostModel 的特征列表
-    MONOTONE_CONSTRAINT_MAP = CatBoostModel.MONOTONE_CONSTRAINT_MAP
-    MARKET_LEVEL_FEATURES = CatBoostModel.MARKET_LEVEL_FEATURES
-    MACRO_CROSS_FEATURES = CatBoostModel.MACRO_CROSS_FEATURES  # P6: 宏交叉特征排除
-    CROSS_SECTIONAL_PERCENTILE_FEATURES = CatBoostModel.CROSS_SECTIONAL_PERCENTILE_FEATURES
-    CROSS_SECTIONAL_ZSCORE_FEATURES = CatBoostModel.CROSS_SECTIONAL_ZSCORE_FEATURES
-    ROLLING_PERCENTILE_FEATURES = CatBoostModel.ROLLING_PERCENTILE_FEATURES
-
-    def __init__(self, loss_function='YetiRank',
-                 use_monotone_constraints=True,
-                 time_decay_lambda=0.5,
-                 use_rolling_percentile=False,
-                 use_cross_sectional_percentile=True,
-                 use_cross_sectional_zscore=True,
-                 feature_importance_threshold=0.0,
-                 use_soft_label=False):  # P5 失败，回退到原始收益率
-        """初始化 CatBoost 排序模型
-
-        Args:
-            loss_function: 排序损失函数（'YetiRank' 或 'YetiRankPairwise'）
-            use_monotone_constraints: 是否使用单调约束
-            time_decay_lambda: 时间衰减系数
-            use_rolling_percentile: 是否使用滚动百分位（已关闭）
-            use_cross_sectional_percentile: 是否使用截面百分位
-            use_cross_sectional_zscore: 是否使用截面 Z-Score
-            feature_importance_threshold: 特征重要性阈值
-            use_soft_label: 是否使用软标签（截面排名百分位），默认 True
-        """
-        super().__init__()
-        self.ranker_model = None
-        self.actual_n_estimators = 0
-        self.model_type = 'catboost_ranker'
-        self.loss_function = loss_function
-        self.use_monotone_constraints = use_monotone_constraints
-        self.time_decay_lambda = time_decay_lambda
-        self.use_rolling_percentile = use_rolling_percentile
-        self.use_cross_sectional_percentile = use_cross_sectional_percentile
-        self.use_cross_sectional_zscore = use_cross_sectional_zscore
-        self.feature_importance_threshold = feature_importance_threshold
-        self.use_soft_label = use_soft_label
-        self.monotone_constraints_list = None
-        self.sample_weights = None
-        self.feature_columns = None
-        self.categorical_encoders = {}
-        self.horizon = 20
-        self.residualizer = None
-        self.cs_feature_stats = {}
-
-        logger.info(f"CatBoostRankerModel 初始化: loss_function={loss_function}, "
-                    f"use_monotone_constraints={use_monotone_constraints}, "
-                    f"time_decay_lambda={time_decay_lambda}, "
-                    f"use_cross_sectional_percentile={use_cross_sectional_percentile}, "
-                    f"use_cross_sectional_zscore={use_cross_sectional_zscore}, "
-                    f"feature_importance_threshold={feature_importance_threshold}, "
-                    f"use_soft_label={use_soft_label}")
-
-    # 复用 CatBoostModel 的方法
-    _build_monotone_constraints = CatBoostModel._build_monotone_constraints
-    _calculate_cross_sectional_percentile_features = CatBoostModel._calculate_cross_sectional_percentile_features
-    _calculate_cross_sectional_zscore_features = CatBoostModel._calculate_cross_sectional_zscore_features
-    get_feature_columns = CatBoostModel.get_feature_columns
-    prepare_data = CatBoostModel.prepare_data
-
-    def train(self, codes, start_date=None, end_date=None, horizon=1, use_feature_selection=False, min_return_threshold=0.0):
-        """训练 CatBoost 排序模型
-
-        关键区别：使用 Future_Return 作为连续标签，group_id=date 分组
-        """
-        import numpy as np
-        import random
-        from catboost import CatBoostRanker, Pool
-        from sklearn.model_selection import TimeSeriesSplit
-
-        # 设置随机种子
-        np.random.seed(42)
-        random.seed(42)
-
-        self.horizon = horizon
-
-        # 准备数据（复用 CatBoostModel 的 prepare_data）
-        print(f"\n{'='*70}")
-        logger.info(f"准备 CatBoostRanker 训练数据（horizon={horizon}）")
-        print(f"{'='*70}")
-
-        df = self.prepare_data(codes, start_date, end_date, horizon, for_backtest=False,
-                               label_type='relative')  # 个股选股模型使用相对标签
-
-        if df is None or len(df) == 0:
-            raise ValueError("数据准备失败或数据为空")
-
-        # 获取特征列
-        self.feature_columns = self.get_feature_columns(df)
-
-        # 处理分类特征
-        categorical_features = []
-        for col in ['Stock_Type', 'Sector', 'Market_Regime']:
-            if col in self.feature_columns:
-                categorical_features.append(self.feature_columns.index(col))
-                if col in df.columns:
-                    df[col] = df[col].fillna('unknown').astype(str)
-                    from sklearn.preprocessing import LabelEncoder
-                    encoder = LabelEncoder()
-                    df[col] = encoder.fit_transform(df[col])
-                    self.categorical_encoders[col] = encoder
-
-        # 排序模型关键：标签选择
-        # P5: 软标签实验 - 使用截面排名百分位作为标签
-        if self.use_soft_label:
-            # 计算每日截面排名百分位（0 到 1 之间）
-            # 这样 YetiRankPairwise 能学到"好多少"而非仅仅"谁更好"
-            df['Return_Rank_Pct'] = df.groupby(df.index.normalize())['Future_Return'].transform(
-                lambda x: x.rank(pct=True)
-            )
-            y = df['Return_Rank_Pct'].values
-            logger.info(f"使用软标签（截面排名百分位）: min={y.min():.4f}, max={y.max():.4f}, mean={y.mean():.4f}")
-        else:
-            # 使用原始收益率作为标签
-            y = df['Future_Return'].values
-            logger.info(f"使用原始收益率作为标签: min={y.min():.4f}, max={y.max():.4f}, mean={y.mean():.4f}")
-
-        # 构建 group_id（每天所有股票为一个排序组）
-        df = df.sort_index()  # 确保按日期排序
-        unique_dates = sorted(df.index.normalize().unique())
-        date_to_gid = {d: i for i, d in enumerate(unique_dates)}
-        group_ids = df.index.normalize().map(date_to_gid).values.astype(int)
-
-        # 特征矩阵
-        X = df[self.feature_columns].values
-
-        # 时间衰减权重
-        if self.time_decay_lambda > 0:
-            dates = df.index
-            max_date = dates.max()
-            days_diff = (max_date - dates).days.values  # 转换为 numpy array
-            self.sample_weights = np.exp(-self.time_decay_lambda * days_diff / 365)
-        else:
-            self.sample_weights = None
-
-        # 模型参数（复用 CatBoostModel 20d 参数）
-        if horizon == 20:
-            n_estimators = 600
-            depth = 7
-            learning_rate = 0.03
-            stopping_rounds = 80
-            l2_leaf_reg = 2
-            subsample = 0.75
-            colsample_bylevel = 0.75
-        elif horizon == 5:
-            n_estimators = 500
-            depth = 6
-            learning_rate = 0.04
-            stopping_rounds = 60
-            l2_leaf_reg = 3
-            subsample = 0.7
-            colsample_bylevel = 0.7
-        else:  # horizon == 1
-            n_estimators = 500
-            depth = 7
-            learning_rate = 0.05
-            stopping_rounds = 40
-            l2_leaf_reg = 3
-            subsample = 0.75
-            colsample_bylevel = 0.7
-
-        ranker_params = {
-            'loss_function': self.loss_function,
-            'eval_metric': 'NDCG',
-            'depth': depth,
-            'learning_rate': learning_rate,
-            'n_estimators': n_estimators,
-            'l2_leaf_reg': l2_leaf_reg,
-            'subsample': subsample,
-            'colsample_bylevel': colsample_bylevel,
-            'random_seed': 2020,
-            'verbose': 100,
-            'early_stopping_rounds': stopping_rounds,
-            'has_time': True,  # 数据是时间有序的
-            'thread_count': -1,
-            'allow_writing_files': False,
-        }
-
-        # 单调约束（YetiRankPairwise 不支持单调约束）
-        if self.loss_function != 'YetiRankPairwise':
-            monotone_constraints = self._build_monotone_constraints(self.feature_columns)
-            if monotone_constraints is not None:
-                ranker_params['monotone_constraints'] = monotone_constraints
-                constrained_pos = sum(1 for c in monotone_constraints if c == 1)
-                constrained_neg = sum(1 for c in monotone_constraints if c == -1)
-                logger.info(f"已启用单调约束: +1={constrained_pos}, -1={constrained_neg}")
-        else:
-            logger.info("YetiRankPairwise 不支持单调约束，已跳过")
-
-        self.ranker_model = CatBoostRanker(**ranker_params)
-
-        # 时间序列 CV
-        tscv = TimeSeriesSplit(n_splits=5, gap=horizon)
-        cv_scores = []
-
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X), 1):
-            X_train_fold, X_val_fold = X[train_idx], X[val_idx]
-            y_train_fold, y_val_fold = y[train_idx], y[val_idx]
-            group_ids_train = group_ids[train_idx]
-            group_ids_val = group_ids[val_idx]
-
-            # P10 修复：Pairwise 损失函数不支持 object weights，改用 group_weight
-            # group_weight 长度必须等于数据长度（每个样本一个权重）
-            # 但同一 group 内的样本权重相同（取该日第一个样本的权重）
-            group_weights_train = None
-            if self.sample_weights is not None:
-                fold_weights = self.sample_weights[train_idx]
-                # 直接使用 fold_weights（每个样本的权重）
-                # 同一日的样本权重相同，所以这实际上就是 group_weight
-                group_weights_train = fold_weights
-
-            train_pool = Pool(
-                data=X_train_fold,
-                label=y_train_fold,
-                group_id=group_ids_train,
-                cat_features=categorical_features if categorical_features else None,
-                group_weight=group_weights_train  # ✅ YetiRank/YetiRankPairwise 支持组权重
-            )
-            val_pool = Pool(
-                data=X_val_fold,
-                label=y_val_fold,
-                group_id=group_ids_val,
-                cat_features=categorical_features if categorical_features else None
-            )
-
-            self.ranker_model.fit(train_pool, eval_set=val_pool, verbose=False)
-
-            # 计算 NDCG 作为 CV 分数
-            val_scores = self.ranker_model.predict(val_pool)
-            try:
-                from sklearn.metrics import ndcg_score
-                # NDCG 需要真实相关性分数
-                ndcg = ndcg_score([y_val_fold], [val_scores])
-                cv_scores.append(ndcg)
-                print(f"   Fold {fold} NDCG: {ndcg:.4f}")
-            except:
-                cv_scores.append(0.0)
-                print(f"   Fold {fold} 完成")
-
-        # 全量数据重训练（P10 修复：使用 group_weight）
-        # group_weight 长度必须等于数据长度
-        group_weights_full = None
-        if self.sample_weights is not None:
-            # 直接使用 sample_weights（每个样本的权重）
-            group_weights_full = self.sample_weights
-
-        full_pool = Pool(
-            data=X,
-            label=y,
-            group_id=group_ids,
-            cat_features=categorical_features if categorical_features else None,
-            group_weight=group_weights_full  # ✅ YetiRank/YetiRankPairwise 支持组权重
-        )
-        self.ranker_model.fit(full_pool, verbose=100)
-
-        self.actual_n_estimators = self.ranker_model.tree_count_
-        print(f"\n✅ CatBoostRanker 训练完成")
-        print(f"   实际训练树数量: {self.actual_n_estimators}")
-        if cv_scores:
-            print(f"   平均 CV NDCG: {np.mean(cv_scores):.4f}")
-
-        # 特征重要性
-        feat_importance = self.ranker_model.get_feature_importance(full_pool, prettified=True)
-        feat_imp = pd.DataFrame({
-            'Feature': self.feature_columns,
-            'Importance': self.ranker_model.get_feature_importance(full_pool)
-        })
-        feat_imp = feat_imp.sort_values('Importance', ascending=False)
-        feat_imp['Impact_Direction'] = 'Unknown'
-
-        # 保存特征重要性
-        feat_imp.to_csv(f'output/ml_trading_model_catboost_ranker_{horizon}d_importance.csv', index=False)
-        logger.info(f"已保存特征重要性至 output/ml_trading_model_catboost_ranker_{horizon}d_importance.csv")
-
-        print(f"\n📊 CatBoostRanker Top 20 重要特征:")
-        print(feat_imp[['Feature', 'Importance']].head(20))
-
-        return self
-
-    def predict_proba(self, X, temperature=1.0):
-        """预测排序分数（兼容 predict_proba 接口）
-
-        返回格式与 CatBoostClassifier.predict_proba() 兼容：
-        - 第一列：1 - sigmoid(score)
-        - 第二列：sigmoid(score)
-
-        参数：
-            X: 特征数据
-            temperature: 温度参数，控制概率分布的陡峭程度
-                        - temperature=1.0: 默认，使用原始分数
-                        - temperature>1.0: 概率分布更平坦（更保守）
-                        - temperature<1.0: 概率分布更陡峭（更激进）
-                        - temperature='auto': 自动根据分数标准差调整
-        """
-        from catboost import Pool
-        from scipy.special import expit
-        import numpy as np
-
-        # 处理输入
-        if isinstance(X, pd.DataFrame):
-            if all(col in X.columns for col in self.feature_columns):
-                test_df = X[self.feature_columns].copy()
-            elif len(X.columns) == len(self.feature_columns):
-                test_df = X.copy()
-                test_df.columns = self.feature_columns
-            else:
-                available_cols = [col for col in self.feature_columns if col in X.columns]
-                if available_cols:
-                    test_df = X[available_cols].copy()
-                else:
-                    raise ValueError("无法从输入数据中提取特征列")
-        else:
-            test_df = pd.DataFrame(X, columns=self.feature_columns)
-
-        # 处理分类特征
-        for col in self.categorical_encoders.keys():
-            if col in test_df.columns:
-                test_df[col] = test_df[col].fillna('unknown').astype(str)
-                encoder = self.categorical_encoders[col]
-                test_df[col] = test_df[col].apply(
-                    lambda x: encoder.transform([x])[0] if x in encoder.classes_ else -1
-                )
-
-        # 填充 NaN
-        test_df = test_df.fillna(0)
-
-        # 获取分类特征索引
-        categorical_features = [self.feature_columns.index(col) for col in self.categorical_encoders.keys() if col in self.feature_columns]
-
-        test_pool = Pool(data=test_df.values, cat_features=categorical_features if categorical_features else None)
-        scores = self.ranker_model.predict(test_pool)
-
-        # 自动温度调整：归一化分数，使标准差约为 1.0
-        # 验证结论：MinMax 归一化导致 IC/Rank IC 下降，已放弃
-        if temperature == 'auto':
-            score_std = np.std(scores)
-            if score_std > 0.001:
-                temperature = score_std
-                logger.info(f"Ranker 自动温度: {temperature:.4f} (分数标准差)")
-            else:
-                temperature = 1.0
-                logger.warning(f"Ranker 分数标准差过小 ({score_std:.4f})，使用默认温度 1.0")
-
-        scaled_scores = scores / temperature
-        proba_col1 = expit(scaled_scores)
-
-        # 调试日志
-        logger.info(f"Ranker 概率分布: min={proba_col1.min():.4f}, max={proba_col1.max():.4f}, mean={proba_col1.mean():.4f}, std={proba_col1.std():.4f}")
-
-        return np.column_stack([1 - proba_col1, proba_col1])
-
-    def predict(self, code, predict_date=None, horizon=None, use_feature_cache=True):
-        """预测单只股票的排序分数"""
-        # 简化实现：调用 prepare_data 获取特征，然后 predict_proba
-        # 完整实现可参考 CatBoostModel.predict()
-        logger.warning("CatBoostRankerModel.predict() 单股预测建议使用 predict_batch() 获取正确的截面特征")
-        # 这里返回一个简化版本
-        return None
-
-    def predict_batch(self, codes, predict_date=None, horizon=None, use_feature_cache=True):
-        """批量预测：先提取所有股票特征，再统一计算截面特征，最后逐只预测
-
-        复用 CatBoostModel 的 3 阶段批量预测架构（含网络特征计算）
-        """
-        if horizon is None:
-            horizon = self.horizon
-
-        if len(self.feature_columns) == 0:
-            raise ValueError("模型未训练，请先调用train()方法")
-
-        logger.info(f"CatBoostRanker 批量预测 {len(codes)} 只股票...")
-
-        # 阶段1：逐只提取原始特征
-        all_features = {}
-        for code in codes:
-            stock_df = self._extract_raw_features_single(code, predict_date, horizon, use_feature_cache)
-            if stock_df is not None:
-                all_features[code] = stock_df
-
-        if not all_features:
-            logger.warning("批量预测：没有成功提取任何股票的特征")
-            return []
-
-        logger.info(f"成功提取 {len(all_features)} 只股票的特征")
-
-        # 阶段2：合并所有股票，计算截面特征
-        combined = pd.concat(all_features.values())
-
-        # 统一索引时区：强制将所有时间戳转换为 tz-naive，避免 groupby 时比较错误
-        # 问题根源：不同股票数据可能来自不同源，索引时区状态不一致
-        # 当合并 tz-aware 和 tz-naive 索引时，pandas 会创建 object 类型 Index
-        def normalize_timestamp(ts):
-            '''将任意时间戳转换为 tz-naive'''
-            try:
-                if hasattr(ts, 'tz') and ts.tz is not None:
-                    return ts.tz_localize(None)
-                return ts
-            except Exception:
-                return pd.Timestamp(ts).tz_localize(None) if pd.Timestamp(ts).tz is not None else pd.Timestamp(ts)
-
-        # 检查索引是否为 object 类型（混合时区情况）
-        if combined.index.dtype == 'object' or (hasattr(combined.index, 'tz') and combined.index.tz is not None):
-            new_index = [normalize_timestamp(ts) for ts in combined.index]
-            combined.index = pd.DatetimeIndex(new_index)
-            logger.debug("批量预测：索引时区已统一为 tz-naive")
-
-        # 计算截面百分位特征
-        if self.use_cross_sectional_percentile:
-            combined = self._calculate_cross_sectional_percentile_features(combined)
-            logger.info("批量预测：截面百分位特征计算完成")
-
-        # 计算截面 Z-Score 特征
-        if self.use_cross_sectional_zscore:
-            combined = self._calculate_cross_sectional_zscore_features(combined)
-            logger.info("批量预测：截面 Z-Score 特征计算完成")
-
-        # ========== 网络特征（跨截面特征，所有股票共享）==========
-        # 批量预测时可以正确计算网络特征（需要所有股票数据）
-        try:
-            from data_services.network_features import get_network_calculator
-
-            logger.info("批量预测：计算网络特征...")
-            network_calc = get_network_calculator()
-
-            # 获取所有股票代码
-            unique_codes = combined['Code'].unique().tolist()
-
-            # 计算网络洞察（中心性、社区等）
-            insights = network_calc.calculate_network_insights(unique_codes, force_refresh=False)
-
-            # 计算节点偏离度（动量网络特征）
-            deviations = network_calc.calculate_node_deviation(unique_codes, score_type='momentum', window=20)
-
-            # P7 新增：计算不同窗口的节点偏离度，用于增量特征
-            deviations_5d = network_calc.calculate_node_deviation(unique_codes, score_type='momentum', window=5)
-
-            # 将网络特征添加到每只股票的数据中
-            network_feature_names = [
-                'net_composite_centrality',
-                'net_community_id',
-                'net_node_deviation',
-                # P7 新增：增量网络特征
-                'net_node_deviation_delta_5d',  # 节点偏离度变化率
-                'net_node_deviation_accel',     # 节点偏离度加速度
-            ]
-
-            # 初始化网络特征列
-            for feat in network_feature_names:
-                combined[feat] = 0.0 if feat != 'net_community_id' else -1
-
-            # 填充网络特征
-            for code in unique_codes:
-                mask = combined['Code'] == code
-
-                # 中心性
-                if code in insights:
-                    combined.loc[mask, 'net_composite_centrality'] = insights[code].get('composite_centrality', 0)
-
-                # 社区ID（分类特征）
-                if code in insights:
-                    combined.loc[mask, 'net_community_id'] = insights[code].get('community', -1)
-
-                # 节点偏离度
-                dev_20d = deviations.get(code, {}).get('node_deviation', 0) if code in deviations else 0
-                dev_5d = deviations_5d.get(code, {}).get('node_deviation', 0) if code in deviations_5d else 0
-
-                combined.loc[mask, 'net_node_deviation'] = dev_20d
-
-                # P7 新增：增量特征
-                combined.loc[mask, 'net_node_deviation_delta_5d'] = dev_20d - dev_5d
-                combined.loc[mask, 'net_node_deviation_accel'] = (dev_20d - dev_5d) / (abs(dev_5d) + 0.001)  # 归一化
-
-            logger.info(f"批量预测：网络特征计算完成（{len(unique_codes)} 只股票）")
-
-        except Exception as e:
-            logger.warning(f"批量预测：网络特征计算失败: {e}，将使用默认值")
-            # 使用默认值
-            network_feature_names = [
-                'net_composite_centrality',
-                'net_community_id',
-                'net_node_deviation',
-                'net_node_deviation_delta_5d',
-                'net_node_deviation_accel',
-            ]
-            for feat in network_feature_names:
-                if feat not in combined.columns:
-                    combined[feat] = 0.0 if feat != 'net_community_id' else -1
-
-        # 阶段3：逐只预测（使用正确的截面特征）
-        results = []
-        for code in all_features.keys():
-            stock_data = combined[combined['Code'] == code]
-            if stock_data.empty:
-                continue
-
-            latest = stock_data.iloc[-1:].copy()
-
-            # 使用辅助方法进行预测
-            result = self._predict_from_features(code, latest, horizon)
-            if result:
-                results.append(result)
-
-        logger.info(f"CatBoostRanker 批量预测完成：{len(results)}/{len(codes)} 只股票")
-        return results
-
-    def save_model(self, filepath):
-        """保存模型"""
-        model_data = {
-            'ranker_model': self.ranker_model,
-            'feature_columns': self.feature_columns,
-            'actual_n_estimators': self.actual_n_estimators,
-            'horizon': self.horizon,
-            'model_type': self.model_type,
-            'loss_function': self.loss_function,
-            'categorical_encoders': self.categorical_encoders,
-            'use_monotone_constraints': self.use_monotone_constraints,
-            'time_decay_lambda': self.time_decay_lambda,
-            'use_cross_sectional_percentile': self.use_cross_sectional_percentile,
-            'use_cross_sectional_zscore': self.use_cross_sectional_zscore,
-            'feature_importance_threshold': self.feature_importance_threshold,
-            'cs_feature_stats': self.cs_feature_stats,
-        }
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_data, f)
-        print(f"CatBoostRanker 模型已保存到 {filepath}")
-
-    def load_model(self, filepath):
-        """加载模型"""
-        with open(filepath, 'rb') as f:
-            model_data = pickle.load(f)
-        self.ranker_model = model_data['ranker_model']
-        self.feature_columns = model_data['feature_columns']
-        self.actual_n_estimators = model_data['actual_n_estimators']
-        self.horizon = model_data.get('horizon', 20)
-        self.model_type = model_data.get('model_type', 'catboost_ranker')
-        self.loss_function = model_data.get('loss_function', 'YetiRank')
-        self.categorical_encoders = model_data.get('categorical_encoders', {})
-        self.use_monotone_constraints = model_data.get('use_monotone_constraints', True)
-        self.time_decay_lambda = model_data.get('time_decay_lambda', 0.5)
-        self.use_cross_sectional_percentile = model_data.get('use_cross_sectional_percentile', True)
-        self.use_cross_sectional_zscore = model_data.get('use_cross_sectional_zscore', True)
-        self.feature_importance_threshold = model_data.get('feature_importance_threshold', 0.0)
-        self.cs_feature_stats = model_data.get('cs_feature_stats', {})
-        print(f"CatBoostRanker 模型已从 {filepath} 加载")
-
 
 class EnsembleModel:
     """融合模型 - 整合 LightGBM、GBDT、CatBoost 三个模型
@@ -8193,21 +6357,15 @@ class EnsembleModel:
         logger.info("融合模型已加载（包含3个子模型和准确率）")
 
     def predict(self, code, predict_date=None):
-        """
-        ✖️  已废弃：单股票预测方法
-
-        此方法已被废弃，因为单股票预测无法计算正确的截面特征。
-        请改用 predict_batch() 方法进行批量预测。
-
+        """融合预测
+        
         Args:
             code: 股票代码
             predict_date: 预测日期
-
+            
         Returns:
             dict: 融合预测结果
         """
-        logger.warning("predict() 单股票预测已废弃，请使用 predict_batch() 方法。")
-
         # 获取三个模型的预测结果
         lgbm_result = self.lgbm_model.predict(code, predict_date, self.horizon)
         gbdt_result = self.gbdt_model.predict(code, predict_date, self.horizon)
@@ -8332,145 +6490,21 @@ class EnsembleModel:
         return result
     
     def predict_batch(self, codes, predict_date=None):
-        """
-        批量预测：使用正确的截面特征计算
-
-        核心改进：
-        - 所有模型都使用 predict_batch() 进行批量预测
-        - CatBoost 批量预测确保截面特征正确计算
-        - LightGBM 和 GBDT 批量预测提升效率
-        - 最后按股票代码融合三个模型的结果
-
+        """批量预测
+        
         Args:
             codes: 股票代码列表
             predict_date: 预测日期
-
+            
         Returns:
             list: 融合预测结果列表
         """
-        if not codes:
-            return []
-
-        logger.info(f"Ensemble 批量预测 {len(codes)} 只股票...")
-
-        # 所有模型都使用批量预测
-        catboost_results = self.catboost_model.predict_batch(codes, predict_date, self.horizon)
-        catboost_dict = {r['code']: r for r in catboost_results if r}
-
-        lgbm_results = self.lgbm_model.predict_batch(codes, predict_date, self.horizon)
-        lgbm_dict = {r['code']: r for r in lgbm_results if r}
-
-        gbdt_results = self.gbdt_model.predict_batch(codes, predict_date, self.horizon)
-        gbdt_dict = {r['code']: r for r in gbdt_results if r}
-
-        # 按股票代码融合结果
         results = []
         for code in codes:
-            result = self._fuse_predictions(code, lgbm_dict.get(code), gbdt_dict.get(code), catboost_dict.get(code))
+            result = self.predict(code, predict_date=predict_date)
             if result:
                 results.append(result)
-
-        logger.info(f"Ensemble 批量预测完成：{len(results)}/{len(codes)} 只股票")
         return results
-
-    def _fuse_predictions(self, code, lgbm_result, gbdt_result, catboost_result):
-        """
-        融合三个模型的预测结果
-
-        Args:
-            code: 股票代码
-            lgbm_result: LightGBM 预测结果
-            gbdt_result: GBDT 预测结果
-            catboost_result: CatBoost 预测结果
-
-        Returns:
-            dict: 融合预测结果
-        """
-        # 收集有效结果
-        results = {}
-        if lgbm_result:
-            results['lgbm'] = lgbm_result
-        if gbdt_result:
-            results['gbdt'] = gbdt_result
-        if catboost_result:
-            results['catboost'] = catboost_result
-
-        if not results:
-            logger.error(f"所有模型预测失败: {code}")
-            return None
-
-        # 获取概率和预测
-        probabilities = [r['probability'] for r in results.values()]
-        predictions = [r['prediction'] for r in results.values()]
-
-        # 融合逻辑（与原来的 predict() 方法相同）
-        if self.fusion_method == 'average':
-            fused_prob = np.mean(probabilities)
-            method_name = "简单平均"
-        elif self.fusion_method == 'weighted':
-            weights = [self.model_accuracies.get(name, 0.5) for name in results.keys()]
-            total_weight = sum(weights)
-            if total_weight > 0:
-                fused_prob = sum(p * w for p, w in zip(probabilities, weights)) / total_weight
-            else:
-                fused_prob = np.mean(probabilities)
-            method_name = "加权平均"
-        elif self.fusion_method == 'dynamic-market':
-            confidences = probabilities
-            try:
-                hsi_data = get_hsi_data_tencent()
-                hsi_return_20d = None
-                if hsi_data is not None and len(hsi_data) >= 20:
-                    hsi_return_20d = (hsi_data['Close'].iloc[-1] - hsi_data['Close'].iloc[-20]) / hsi_data['Close'].iloc[-20]
-                hsi_data_dict = {'return_20d': hsi_return_20d} if hsi_return_20d is not None else None
-            except Exception as e:
-                logger.warning(f"获取恒生指数数据失败: {e}")
-                hsi_data_dict = None
-            fused_prob, strategy_name = self.dynamic_strategy.predict(probabilities, confidences, hsi_data_dict)
-            method_name = f"动态市场 ({strategy_name})"
-        else:  # voting
-            fused_pred = 1 if sum(predictions) >= len(predictions) / 2 else 0
-            fused_prob = sum(predictions) / len(predictions)
-            method_name = "投票机制"
-
-        fused_pred = 1 if fused_prob > 0.5 else 0
-
-        # 计算一致性
-        if len(results) == 3:
-            consistency_pct = 100 if predictions.count(predictions[0]) == 3 else (67 if predictions.count(predictions[0]) == 2 or predictions.count(predictions[1]) == 2 else 33)
-        elif len(results) == 2:
-            consistency_pct = 100 if predictions.count(predictions[0]) == 2 else 50
-        else:
-            consistency_pct = 100
-
-        # 计算置信度
-        if fused_prob > 0.60:
-            confidence = "高"
-            fused_direction = 1
-        elif fused_prob > 0.50:
-            confidence = "中"
-            fused_direction = 0.5
-        else:
-            confidence = "低"
-            fused_direction = 0
-
-        # 构建结果
-        first_result = list(results.values())[0]
-        result = {
-            'code': code,
-            'name': STOCK_NAMES.get(code, code),
-            'fusion_method': method_name,
-            'fused_prediction': fused_direction,
-            'fused_probability': float(fused_prob),
-            'confidence': confidence,
-            'consistency': f"{consistency_pct}%",
-            'current_price': first_result['current_price'],
-            'date': first_result['date'],
-            'model_predictions': {name: {'prediction': int(r['prediction']), 'probability': float(r['probability'])}
-                                  for name, r in results.items()}
-        }
-
-        return result
     
     def predict_proba(self, X):
         """预测概率（用于回测评估器）
@@ -8853,23 +6887,20 @@ def main():
 
         print(f"已加载 {model_name} 模型")
 
-        # 预测所有股票（所有模型都使用批量预测）
+        # 预测所有股票
         predictions = []
         if args.predict_date:
             print(f"基于日期: {args.predict_date}")
-
+        
         if ensemble_model:
-            # 使用融合模型批量预测（关键：确保截面特征正确）
+            # 使用融合模型预测
             predictions = ensemble_model.predict_batch(WATCHLIST, args.predict_date)
-        elif catboost_model:
-            # CatBoost 使用批量预测（关键：确保截面特征正确）
-            predictions = catboost_model.predict_batch(WATCHLIST, args.predict_date, args.horizon)
-        elif lgbm_model:
-            # LightGBM 使用批量预测
-            predictions = lgbm_model.predict_batch(WATCHLIST, args.predict_date, args.horizon)
-        elif gbdt_model:
-            # GBDT 使用批量预测
-            predictions = gbdt_model.predict_batch(WATCHLIST, args.predict_date, args.horizon)
+        else:
+            # 使用单一模型预测
+            for code in WATCHLIST:
+                result = model.predict(code, predict_date=args.predict_date)
+                if result:
+                    predictions.append(result)
 
         # 显示预测结果
         print("\n预测结果:")

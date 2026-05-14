@@ -28,7 +28,7 @@ STOCK_SECTOR_MAPPING = {
     # 半导体股 (semiconductor)
     '0981.HK': {'sector': 'semiconductor', 'name': '中芯国际', 'type': 'semiconductor', 'defensive': 25, 'growth': 80, 'cyclical': 70, 'liquidity': 75, 'risk': 75},
     '1347.HK': {'sector': 'semiconductor', 'name': '华虹半导体', 'type': 'semiconductor', 'defensive': 20, 'growth': 85, 'cyclical': 75, 'liquidity': 70, 'risk': 80},
-    # 注：02382.HK 舜宇光学科技 已退市，2026-05-03 移除
+    '2382.HK': {'sector': 'semiconductor', 'name': '舜宇光学科技', 'type': 'semiconductor', 'defensive': 25, 'growth': 80, 'cyclical': 70, 'liquidity': 70, 'risk': 75},
 
     # 人工智能股 (ai)
     '6682.HK': {'sector': 'ai', 'name': '范式智能', 'type': 'ai', 'defensive': 20, 'growth': 90, 'cyclical': 50, 'liquidity': 60, 'risk': 85},
@@ -118,7 +118,7 @@ SECTOR_NAME_MAPPING = {
     'auto': '汽车股',
 }
 
-# 自选股列表（核心28只，用于预测和日常监控）
+# 自选股列表（核心30只，用于预测和日常监控）
 WATCHLIST = {
     "0005.HK": "汇丰银行",
     "0012.HK": "恒基地产",
@@ -139,22 +139,25 @@ WATCHLIST = {
     "1398.HK": "工商银行",
     "1810.HK": "小米集团-W",
     "2269.HK": "药明生物",
+    "2388.HK": "中银香港",
     "2533.HK": "黑芝麻智能",
     "2800.HK": "盈富基金",
     "3690.HK": "美团-W",
     "3968.HK": "招商银行",
     "6682.HK": "范式智能",
     "9660.HK": "地平线机器人",
+    "9888.HK": "百度集团-SW",
     "9988.HK": "阿里巴巴-SW",
     "1211.HK": "比亚迪股份",
     "1299.HK": "友邦保险",
+    "2318.HK": "中国平安",
 }
 
-# 训练用股票列表（扩展45只，用于模型训练以增加样本量）
-# 包含WATCHLIST全部28只 + 17只额外股票
+# 训练用股票列表（扩展59只，用于模型训练以增加样本量）
+# 包含WATCHLIST全部28只 + 31只额外股票
 TRAINING_STOCKS = {
     **WATCHLIST,  # 继承核心28只
-    # 额外17只股票（从STOCK_SECTOR_MAPPING补充）
+    # 额外31只股票（从STOCK_SECTOR_MAPPING补充）
     "0002.HK": "中电控股",
     "0006.HK": "电能实业",
     "0151.HK": "中国旺旺",
@@ -178,7 +181,6 @@ TRAINING_STOCKS = {
     "1171.HK": "兖矿能源",
     "1798.HK": "赣锋锂业",
     "2282.HK": "比亚迪电子",
-    "2318.HK": "中国平安",
     "2388.HK": "中银香港",
     "2601.HK": "中国太保",
     "3800.HK": "保利协鑫能源",
